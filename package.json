@@ -1,0 +1,7 @@
+{
+  "name": "super-file-bot",
+  "version": "1.0.0",
+  "dependencies": {
+    "telegraf": "^4.12.0"
+  }
+}
