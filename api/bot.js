@@ -1,241 +1,231 @@
 // api/bot.js
 const { Telegraf, Markup } = require('telegraf');
 
-// --- 1. CONFIGURATION (From Vercel Environment Variables) ---
+// --- CONFIGURATION ---
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CHANNEL_ID = process.env.CHANNEL_ID; 
 const ADMIN_ID = Number(process.env.ADMIN_ID);
+const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
-// Force Sub Channels: Get string "id1, id2" -> convert to Array [id1, id2]
-const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "")
-    .split(',')
-    .map(id => id.trim())
-    .filter(id => id);
+// --- MEMORY STORAGE ---
+let userModes = {};     
+let batchStorage = {};  
 
-// --- 2. MEMORY STORAGE (Volatile - For Batching) ---
-// Vercel serverless functions restart often, so finish batch uploads quickly.
-let userModes = {};     // Stores 'single' or 'batch' for Admin
-let batchStorage = {};  // Stores files temporarily
+// --- HELPERS ---
 
-// --- 3. HELPER FUNCTIONS ---
-
-// Encrypt Message ID to look like a Random Code
 const encodePayload = (msgId) => {
     const text = `File_${msgId}_Secure`; 
     return Buffer.from(text).toString('base64').replace(/=/g, ''); 
 };
 
-// Decrypt Random Code back to Message ID
 const decodePayload = (code) => {
     try {
         const text = Buffer.from(code, 'base64').toString('utf-8');
         const parts = text.split('_');
-        if (parts[0] === 'File' && parts[2] === 'Secure') {
-            return parseInt(parts[1]);
-        }
+        if (parts[0] === 'File' && parts[2] === 'Secure') return parseInt(parts[1]);
         return null;
-    } catch (error) {
-        return null;
-    }
+    } catch (e) { return null; }
 };
 
-// Get first 2 words for Grouping (Automation)
+// Caption Cleaner: Removes "Main Channel..." and other unwanted lines
+const cleanCaption = (text) => {
+    if (!text) return "Untitled File";
+    
+    return text
+        .replace(/⭕️ Main Channel : @StarFlixTamil ⭕️/g, "") // Remove specific tag
+        .replace(/@[\w_]+/g, "") // Remove any other @username
+        .replace(/(Main Channel|Join Channel).*/gi, "") // Remove lines starting with Main Channel
+        .trim(); // Remove extra spaces
+};
+
+// Grouping Logic (First 2 words)
 const getGroupId = (text) => {
-    if (!text) return "Unknown";
-    const words = text.split(' ');
+    const cleaned = cleanCaption(text);
+    const words = cleaned.split(' ').filter(w => w.trim() !== ""); // Filter empty spaces
     if (words.length >= 2) return `${words[0]} ${words[1]}`.toLowerCase();
-    return words[0].toLowerCase();
+    return words[0] ? words[0].toLowerCase() : "unknown";
 };
 
-// Check if User joined all Force Sub Channels
 const checkForceSub = async (ctx, userId) => {
-    if (userId === ADMIN_ID) return true; // Admin needs no check
-    if (FORCE_SUB_IDS.length === 0) return true; // No channels configured
-
+    if (userId === ADMIN_ID || FORCE_SUB_IDS.length === 0) return true;
     for (const channelId of FORCE_SUB_IDS) {
         try {
             const member = await ctx.telegram.getChatMember(channelId, userId);
-            if (['left', 'kicked', 'restricted'].includes(member.status)) {
-                return false;
-            }
-        } catch (err) {
-            console.error(`ForceSub Error for ${channelId}:`, err.message);
-            return false; // Assume not joined if error (or bot not admin)
-        }
+            if (['left', 'kicked', 'restricted'].includes(member.status)) return false;
+        } catch (e) { return false; }
     }
     return true;
 };
 
-// Generate "Join Channel" Buttons
-const getJoinButtons = async (ctx, startPayload) => {
+const getJoinButtons = async (ctx, payload) => {
     const buttons = [];
-    for (const channelId of FORCE_SUB_IDS) {
+    for (const id of FORCE_SUB_IDS) {
         try {
-            const chat = await ctx.telegram.getChat(channelId);
+            const chat = await ctx.telegram.getChat(id);
             const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
             buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
-        } catch (e) {
-            console.log(`Bot not admin in ${channelId}`);
-        }
+        } catch (e) {}
     }
-    // "Try Again" button carries the file code (payload) so user gets file immediately after joining
-    const callbackData = startPayload ? `checksub_${startPayload}` : 'checksub_home';
-    buttons.push([Markup.button.callback('🔄 Try Again / Verified', callbackData)]);
+    const cb = payload ? `checksub_${payload}` : 'checksub_home';
+    buttons.push([Markup.button.callback('🔄 Try Again / Verified', cb)]);
     return Markup.inlineKeyboard(buttons);
 };
 
-// --- 4. COMMANDS & ADMIN LOGIC ---
+// --- ADMIN PANEL BUTTONS ---
+const getAdminKeyboard = (mode, count) => {
+    const modeIcon = mode === 'batch' ? '🟢 Batch On' : '🔴 Batch Off (Single)';
+    return Markup.inlineKeyboard([
+        [Markup.button.callback(`🔄 Switch Mode (${mode.toUpperCase()})`, 'admin_switch')],
+        [Markup.button.callback(`📤 Process Batch (${count})`, 'admin_process')],
+        [Markup.button.callback(`❌ Clear Batch`, 'admin_clear')]
+    ]);
+};
 
-// Toggle Mode: Single <-> Batch
-bot.command('mode', async (ctx) => {
+// --- ADMIN ACTIONS ---
+
+// 1. Switch Mode Action
+bot.action('admin_switch', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     
-    const currentMode = userModes[ctx.from.id] || 'single';
-    const newMode = currentMode === 'single' ? 'batch' : 'single';
-    userModes[ctx.from.id] = newMode;
+    const cur = userModes[ctx.from.id] || 'single';
+    const next = cur === 'single' ? 'batch' : 'single';
+    userModes[ctx.from.id] = next;
     
-    if (newMode === 'single') delete batchStorage[ctx.from.id]; // Clear memory
+    if (next === 'single') delete batchStorage[ctx.from.id];
     
-    await ctx.reply(`🔄 **Mode Changed!**\n\nCurrent Mode: **${newMode.toUpperCase()}**\n` + 
-        (newMode === 'batch' ? 'Files will be stored. Use `/done` to publish.' : 'Files will be processed immediately.'));
+    const count = batchStorage[ctx.from.id] ? batchStorage[ctx.from.id].length : 0;
+    
+    await ctx.editMessageText(
+        `⚙️ **Admin Panel**\n\nCurrent Mode: **${next.toUpperCase()}**\nFiles in Queue: ${count}`,
+        { parse_mode: 'Markdown', ...getAdminKeyboard(next, count) }
+    );
 });
 
-// Process Batch (/done)
-bot.command('done', async (ctx) => {
+// 2. Process Batch Action
+bot.action('admin_process', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     
     const files = batchStorage[ctx.from.id];
-    if (!files || files.length === 0) return ctx.reply('⚠️ No files in batch.');
+    if (!files || !files.length) return ctx.answerCbQuery('⚠️ Batch is empty!', { show_alert: true });
 
     await ctx.reply('⚙️ Processing Automation...');
     
-    // Group files by First 2 Words
     const groups = {};
-    files.forEach(file => {
-        const name = file.caption || "Untitled";
-        const groupKey = getGroupId(name);
+    files.forEach(f => {
+        const groupKey = getGroupId(f.raw_caption); // Group by cleaned name
         if (!groups[groupKey]) groups[groupKey] = [];
-        groups[groupKey].push(file);
+        groups[groupKey].push(f);
     });
 
-    // Send Consolidated Messages
-    for (const groupKey in groups) {
-        let msgText = "";
-        groups[groupKey].forEach(file => {
-            // Sanitize caption for HTML
-            const safeCaption = (file.caption || "File").replace(/<|>/g, '');
-            msgText += `🔹 <a href="${file.link}">${safeCaption}</a>\n\n`;
+    for (const k in groups) {
+        let txt = "";
+        groups[k].forEach(f => {
+            // FIX: Removed Diamond symbol, Used cleaned caption
+            const cleanName = cleanCaption(f.raw_caption);
+            txt += `<a href="${f.link}">${cleanName}</a>\n\n`;
         });
-
-        try {
-            await ctx.reply(msgText, { parse_mode: 'HTML', disable_web_page_preview: true });
+        
+        try { 
+            await ctx.reply(txt, { parse_mode: 'HTML', disable_web_page_preview: true }); 
         } catch (e) {
-            await ctx.reply(`❌ Error sending group: ${groupKey}`);
+            await ctx.reply('❌ Error sending a group.');
         }
     }
-
+    
     delete batchStorage[ctx.from.id];
-    await ctx.reply('✅ Automation Complete!');
+    
+    // Refresh Panel
+    await ctx.reply('✅ Automation Complete!', getAdminKeyboard(userModes[ctx.from.id], 0));
 });
 
-// Admin File Upload Handler
-bot.on(['document', 'video', 'audio'], async (ctx) => {
-    // 1. Restriction: Only Admin can upload
-    if (ctx.from.id !== ADMIN_ID) {
-        return ctx.reply('⛔ Access Denied! Only Admin can add files.');
-    }
+// 3. Clear Batch Action
+bot.action('admin_clear', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    delete batchStorage[ctx.from.id];
+    const mode = userModes[ctx.from.id] || 'single';
+    
+    await ctx.editMessageText(
+        `⚙️ **Admin Panel**\n\nBatch Cleared! Queue is empty.`,
+        { parse_mode: 'Markdown', ...getAdminKeyboard(mode, 0) }
+    );
+});
 
+// --- ADMIN UPLOAD LOGIC ---
+bot.on(['document', 'video', 'audio'], async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
+    
     try {
+        // Copy to Channel
+        const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
+        const code = encodePayload(sent.message_id);
+        const link = `https://t.me/${ctx.botInfo.username}?start=${code}`;
         const mode = userModes[ctx.from.id] || 'single';
         
-        // A. Copy File to DB Channel (No Forward Tag)
-        const sentMsg = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
-        
-        // B. Generate Secret Link
-        const secureCode = encodePayload(sentMsg.message_id);
-        const shareLink = `https://t.me/${ctx.botInfo.username}?start=${secureCode}`;
-        
-        // Get Filename/Caption
-        const msg = ctx.message;
-        let displayName = msg.caption;
-        if (!displayName) {
-             if (msg.document) displayName = msg.document.file_name;
-             else if (msg.video) displayName = msg.video.file_name || "Video";
-             else if (msg.audio) displayName = msg.audio.file_name || "Audio";
-        }
+        // Get Caption
+        let rawCap = ctx.message.caption;
+        if (!rawCap && ctx.message.document) rawCap = ctx.message.document.file_name;
+        if (!rawCap && ctx.message.video) rawCap = ctx.message.video.file_name;
+        if (!rawCap && ctx.message.audio) rawCap = ctx.message.audio.file_name;
+        if (!rawCap) rawCap = "Untitled File";
 
-        // C. Handle Modes
+        // Logic
         if (mode === 'single') {
-            await ctx.reply(`✅ **Stored!**\n📂 ${displayName}\n🔗 ${shareLink}`, { disable_web_page_preview: true });
+            const cleanName = cleanCaption(rawCap);
+            await ctx.reply(`✅ **Saved!**\n📂 ${cleanName}\n🔗 ${link}`, { disable_web_page_preview: true });
         } else {
             if (!batchStorage[ctx.from.id]) batchStorage[ctx.from.id] = [];
-            batchStorage[ctx.from.id].push({ caption: displayName, link: shareLink });
+            batchStorage[ctx.from.id].push({ raw_caption: rawCap, link: link });
+            
+            // Update Admin Panel text if possible (Optional, keeping it simple here)
+            // Just reply simple ack
+            const count = batchStorage[ctx.from.id].length;
+            await ctx.reply(`📥 Added to Batch (${count})`);
         }
-
-    } catch (error) {
-        console.error(error);
-        await ctx.reply('❌ Error: Check Channel ID & Bot Admin Rights.');
-    }
+    } catch (e) { await ctx.reply('❌ Error: Bot not admin in DB Channel.'); }
 });
 
-// --- 5. USER INTERACTION & FORCE SUB ---
-
-// Handle "Try Again" Button
+// --- USER & START LOGIC ---
 bot.action(/checksub_(.+)/, async (ctx) => {
-    const payload = ctx.match[1]; // Get 'home' or file code
-    const isJoined = await checkForceSub(ctx, ctx.from.id);
-
-    if (isJoined) {
-        await ctx.deleteMessage(); // Delete the "Join" warning
-        if (payload === 'checksub_home') {
-            await ctx.reply('👋 Welcome! You are verified.');
-        } else {
-            // Deliver the file requested
-            const msgId = decodePayload(payload);
-            if (msgId) {
-                try {
-                    await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, msgId);
-                } catch (e) { await ctx.reply('❌ File not found.'); }
-            }
-        }
-    } else {
-        await ctx.answerCbQuery('⚠️ You have not joined yet!', { show_alert: true });
-    }
+    const pl = ctx.match[1];
+    if (await checkForceSub(ctx, ctx.from.id)) {
+        await ctx.deleteMessage();
+        if (pl !== 'checksub_home') {
+            const id = decodePayload(pl);
+            if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e){}
+        } else await ctx.reply('👋 Welcome!');
+    } else await ctx.answerCbQuery('⚠️ Join channels first!', { show_alert: true });
 });
 
-// Start Command
 bot.start(async (ctx) => {
-    const payload = ctx.payload;
-    const isJoined = await checkForceSub(ctx, ctx.from.id);
-
-    // If NOT Joined -> Show Force Sub Buttons
-    if (!isJoined) {
-        const buttons = await getJoinButtons(ctx, payload);
-        return ctx.reply('⚠️ Access Restricted\n\nPlease join our channels to access files.', buttons);
+    const pl = ctx.payload;
+    
+    // Check Force Sub
+    if (!await checkForceSub(ctx, ctx.from.id)) {
+        return ctx.reply('⚠️ **Join Channels to Access**', await getJoinButtons(ctx, pl));
     }
 
-    // If Joined -> Process Request
-    if (payload) {
-        const msgId = decodePayload(payload);
-        if (msgId) {
-            try {
-                // Copy without forward tag
-                await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, msgId);
-            } catch (error) { await ctx.reply('❌ File unavailable.'); }
-        } else {
-            await ctx.reply('❌ Invalid Link.');
-        }
+    // Process Link
+    if (pl) {
+        const id = decodePayload(pl);
+        if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File gone.'); }
+        else ctx.reply('❌ Invalid Link.');
     } else {
+        // ADMIN PANEL OPENER
         if (ctx.from.id === ADMIN_ID) {
             const mode = userModes[ctx.from.id] || 'single';
-            await ctx.reply(`👋 Admin Panel\nCurrent Mode: ${mode.toUpperCase()}\n\n/mode - Switch Mode\n/done - Finish Batch`);
+            const count = batchStorage[ctx.from.id] ? batchStorage[ctx.from.id].length : 0;
+            
+            await ctx.reply(
+                `⚙️ **Admin Panel**\n\nControl your bot settings here.`,
+                { parse_mode: 'Markdown', ...getAdminKeyboard(mode, count) }
+            );
         } else {
-            await ctx.reply('Join @StarFlixTamil \nSend me a valid link to get files.');
+            ctx.reply('🤖 Send me a link to get files.');
         }
     }
 });
 
-// --- 6. VERCEL HANDLER ---
+// Vercel Handler
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
@@ -243,9 +233,6 @@ export default async function handler(req, res) {
             await bot.handleUpdate(req.body);
             return res.status(200).send('OK');
         }
-        return res.status(200).send('Bot Active 🚀');
-    } catch (e) {
-        console.error(e);
-        return res.status(500).send('Error');
-    }
+        return res.status(200).send('Active');
+    } catch (e) { return res.status(500).send('Error'); }
 }
