@@ -142,7 +142,7 @@ bot.command('done', async (ctx) => {
 bot.on(['document', 'video', 'audio'], async (ctx) => {
     // 1. Restriction: Only Admin can upload
     if (ctx.from.id !== ADMIN_ID) {
-        return ctx.reply('⛔ **Access Denied!** Only Admin can add files.');
+        return ctx.reply('⛔ Access Denied! Only Admin can add files.');
     }
 
     try {
@@ -211,7 +211,7 @@ bot.start(async (ctx) => {
     // If NOT Joined -> Show Force Sub Buttons
     if (!isJoined) {
         const buttons = await getJoinButtons(ctx, payload);
-        return ctx.reply('⚠️ **Access Restricted**\n\nPlease join our channels to access files.', buttons);
+        return ctx.reply('⚠️ Access Restricted\n\nPlease join our channels to access files.', buttons);
     }
 
     // If Joined -> Process Request
@@ -228,9 +228,9 @@ bot.start(async (ctx) => {
     } else {
         if (ctx.from.id === ADMIN_ID) {
             const mode = userModes[ctx.from.id] || 'single';
-            await ctx.reply(`👋 **Admin Panel**\nCurrent Mode: ${mode.toUpperCase()}\n\n/mode - Switch Mode\n/done - Finish Batch`);
+            await ctx.reply(`👋 Admin Panel\nCurrent Mode: ${mode.toUpperCase()}\n\n/mode - Switch Mode\n/done - Finish Batch`);
         } else {
-            await ctx.reply('🤖 **File Store Bot**\nSend me a valid link to get files.');
+            await ctx.reply('Join @StarFlixTamil \nSend me a valid link to get files.');
         }
     }
 });
