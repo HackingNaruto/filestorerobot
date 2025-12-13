@@ -142,46 +142,52 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
-// --- 🔥 SIMPLE LINE-BY-LINE SHORTENER 🔥 ---
+// --- 🔥 PARALLEL PROCESSING BATCH SHORTENER (FASTEST) 🔥 ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing lines...');
+    await ctx.answerCbQuery('⏳ Processing fast...');
     
     const text = ctx.callbackQuery.message.text;
     if (!text) return;
 
-    // 1. Split text into individual lines
+    // 1. Find all Telegram Links
+    const matches = [...text.matchAll(/https:\/\/t\.me\/[^\s]+/g)];
+    if (matches.length === 0) return ctx.answerCbQuery('No links found');
+
+    // 2. Extract Unique URLs to avoid duplicate API calls
+    const uniqueUrls = [...new Set(matches.map(m => m[0]))];
+
+    // 3. Shorten ALL links in PARALLEL (At the same time)
+    const shortLinksMap = {};
+    
+    await Promise.all(uniqueUrls.map(async (longUrl) => {
+        const short = await getShortLink(longUrl);
+        if (short) shortLinksMap[longUrl] = short;
+    }));
+
+    // 4. Rebuild the Message Line-by-Line
     const lines = text.split('\n');
     let newLines = [];
 
-    // 2. Loop through every line
     for (let line of lines) {
-        // 3. Check if line contains a Telegram Link
         if (line.includes('https://t.me/')) {
-            // Extract the URL (removes any accidental spaces)
             const match = line.match(/(https:\/\/t\.me\/[^\s]+)/);
             if (match) {
                 const longUrl = match[0];
-                const shortUrl = await getShortLink(longUrl);
-                
-                // If shortened success, use Short Link. Else keep Original.
-                if (shortUrl) {
-                    newLines.push(shortUrl);
-                } else {
-                    newLines.push(line);
-                }
+                // Replace with short link if available, else keep original
+                const replacement = shortLinksMap[longUrl] || longUrl;
+                newLines.push(replacement);
             } else {
                 newLines.push(line);
             }
         } else {
-            // 4. If it's a Caption or Empty line, keep it exactly as is
+            // Keep Caption lines
             newLines.push(line);
         }
     }
 
-    // 5. Rejoin lines and send
     const finalMessage = newLines.join('\n');
 
     try {
