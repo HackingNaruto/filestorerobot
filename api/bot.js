@@ -1,6 +1,5 @@
 const { Telegraf, Markup } = require('telegraf');
 const FormData = require('form-data');
-// Node 18+ has native fetch, but for safety in some envs we use standard handling
 
 // --- CONFIGURATION ---
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -14,10 +13,14 @@ global.shortenerConfig = global.shortenerConfig || {
     domain: process.env.SHORTENER_DOMAIN || "", 
     key: process.env.SHORTENER_KEY || ""
 };
-global.telegraphToken = global.telegraphToken || ""; // Stores temp token
+global.telegraphToken = global.telegraphToken || ""; 
+
+// --- ERROR HANDLING ---
+bot.catch((err, ctx) => {
+    console.error(`Error`, err);
+});
 
 // --- HELPERS ---
-
 const encodePayload = (msgId) => {
     const text = `File_${msgId}_Secure`; 
     return Buffer.from(text).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_'); 
@@ -56,24 +59,27 @@ const getShortLink = async (longUrl) => {
     } catch (error) { return null; }
 };
 
-// 2. Upload to Catbox
+// 2. Upload to Catbox (FIXED WITH HEADERS)
 const uploadToCatbox = async (fileUrl) => {
     try {
-        // Fetch file from Telegram
+        // Fetch Image
         const fileRes = await fetch(fileUrl);
         const buffer = await fileRes.arrayBuffer();
         
+        // Create Form Data
         const form = new FormData();
         form.append('reqtype', 'fileupload');
-        form.append('fileToUpload', Buffer.from(buffer), 'image.jpg');
+        form.append('fileToUpload', Buffer.from(buffer), { filename: 'image.jpg', contentType: 'image/jpeg' });
 
+        // Upload with Headers (Important for Node.js)
         const response = await fetch('https://catbox.moe/user/api.php', {
             method: 'POST',
-            body: form
+            body: form,
+            headers: form.getHeaders() // <--- THIS WAS MISSING
         });
         
         const text = await response.text();
-        if (text.startsWith('http')) return text;
+        if (text.startsWith('http')) return text.trim();
         return null;
     } catch (e) {
         console.error("Catbox Error:", e);
@@ -84,14 +90,12 @@ const uploadToCatbox = async (fileUrl) => {
 // 3. Create Telegraph Page
 const createTelegraphPage = async (title, nodes) => {
     try {
-        // Create Account if not exists
         if (!global.telegraphToken) {
             const accRes = await fetch(`https://api.telegra.ph/createAccount?short_name=FileBot&author_name=Admin`);
             const accData = await accRes.json();
             if (accData.ok) global.telegraphToken = accData.result.access_token;
         }
 
-        // Create Page
         const contentStr = JSON.stringify(nodes);
         const response = await fetch('https://api.telegra.ph/createPage', {
             method: 'POST',
@@ -117,7 +121,7 @@ const createTelegraphPage = async (title, nodes) => {
 const getAdminKeyboard = () => {
     return Markup.inlineKeyboard([
         [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')],
-        [Markup.button.callback(`📝 Create Graph.org Page`, 'batch_create_graph')], // New Button
+        [Markup.button.callback(`📝 Create Graph.org Page`, 'batch_create_graph')],
         [Markup.button.callback(`❌ Clear Queue`, 'batch_clear')]
     ]);
 };
@@ -136,7 +140,7 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 MAIN LOGIC: PROCESS BATCH & CREATE GRAPH 🔥 ---
+// --- CREATE GRAPH PAGE ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -149,83 +153,70 @@ bot.action('batch_create_graph', async (ctx) => {
         return ctx.reply('⚠️ Shortener not configured!');
     }
 
-    await ctx.reply("⏳ Processing... Uploading Image & Shortening Links...");
+    await ctx.reply("⏳ Processing... Creating Page...");
 
-    // 1. Prepare Content for Telegraph
     let domNodes = [];
 
-    // Add Poster Image (If exists)
+    // Add Poster
     if (userData.poster) {
-        domNodes.push({
-            tag: 'img',
-            attrs: { src: userData.poster }
-        });
+        domNodes.push({ tag: 'img', attrs: { src: userData.poster } });
         domNodes.push({ tag: 'br' });
     }
 
-    // Add Title/Header
-    domNodes.push({ tag: 'h3', children: ['📂 Download Files'] });
+    // Add Header
+    domNodes.push({ tag: 'h4', children: ['📂 Download Files'] });
     domNodes.push({ tag: 'hr' });
 
-    // 2. Process Files (Shorten Links)
+    // Process Files
     for (const file of userData.files) {
         const shortLink = await getShortLink(file.longLink) || file.longLink;
         
-        // Structure: 
-        // File Name (Bold)
-        // Link (Clickable)
         domNodes.push({ 
             tag: 'p', 
             children: [
                 { tag: 'b', children: [file.caption] },
                 { tag: 'br' },
-                { tag: 'a', attrs: { href: shortLink }, children: ['📥 Download/Watch Here'] }
+                { tag: 'a', attrs: { href: shortLink }, children: ['📥 Download Here'] }
             ]
         });
         domNodes.push({ tag: 'br' });
     }
 
-    // Add Footer
     domNodes.push({ tag: 'hr' });
-    domNodes.push({ tag: 'i', children: ['Created by FileStore Bot'] });
+    domNodes.push({ tag: 'i', children: ['Join our Channel'] });
 
-    // 3. Publish to Telegraph
     const pageTitle = userData.files[0] ? userData.files[0].caption : "File Collection";
     const graphUrl = await createTelegraphPage(pageTitle, domNodes);
 
     if (graphUrl) {
         await ctx.reply(`✅ **Graph Page Created!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
-        // Clear queue
         delete global.batchStorage[ctx.from.id];
     } else {
-        await ctx.reply("❌ Failed to create Graph page. Try again.");
+        await ctx.reply("❌ Failed to create Graph page.");
     }
 });
 
+// --- UPLOAD HANDLERS ---
 
-// --- ADMIN UPLOAD HANDLERS ---
-
-// 1. Handle PHOTOS (Poster Image)
+// 1. Handle POSTER
 bot.on('photo', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
 
-    await ctx.reply("🖼 Uploading image to Catbox... Wait...");
+    await ctx.reply("🖼 Uploading to Catbox...");
 
     try {
-        // Get highest resolution photo
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         const fileLink = await ctx.telegram.getFileLink(photo.file_id);
         
-        // Upload to Catbox
         const catboxUrl = await uploadToCatbox(fileLink.href);
 
         if (catboxUrl) {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
             global.batchStorage[ctx.from.id].poster = catboxUrl;
             
-            await ctx.reply(`✅ **Poster Set!**\nURL: ${catboxUrl}\n\nNow send files to add to this page.`, getAdminKeyboard());
+            await ctx.reply(`✅ **Poster Set!**\n\nNow send files.`, getAdminKeyboard());
         } else {
-            await ctx.reply("❌ Catbox Upload Failed.");
+            await ctx.reply("❌ Catbox Upload Failed. Check Logs.");
         }
     } catch (e) {
         console.error(e);
@@ -233,7 +224,7 @@ bot.on('photo', async (ctx) => {
     }
 });
 
-// 2. Handle FILES (Movies/Docs)
+// 2. Handle FILES
 bot.on(['document', 'video', 'audio'], async (ctx) => {
     if (!ctx.from) return; 
     if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
@@ -250,7 +241,6 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
         if (!rawCap) rawCap = "Untitled File";
         const safeName = cleanCaption(rawCap);
 
-        // Store in Queue
         if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
         
         global.batchStorage[ctx.from.id].files.push({
@@ -260,13 +250,12 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
 
         const count = global.batchStorage[ctx.from.id].files.length;
         if (count === 1) {
-            await ctx.reply(`📥 **Batch Started.**\n\nSend Image (Poster) -> Send Files -> Click 'Create Graph'`, getAdminKeyboard());
+            await ctx.reply(`📥 **Batch Started.**\n\nSend Image -> Send Files -> Click 'Create Graph'`, getAdminKeyboard());
         }
 
     } catch (e) { ctx.reply('❌ DB Channel Error.'); }
 });
 
-// --- STANDARD CONFIG & START ---
 const checkForceSub = async (ctx, userId) => {
     if (!userId) return true;
     if (userId === ADMIN_ID) return true;
@@ -325,7 +314,20 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// Vercel Handler
+const getJoinButtons = async (ctx, payload) => {
+    const buttons = [];
+    for (const id of FORCE_SUB_IDS) {
+        try {
+            const chat = await ctx.telegram.getChat(id);
+            const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
+            buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
+        } catch (e) {}
+    }
+    const cb = payload ? `checksub_${payload}` : 'checksub_home';
+    buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
+    return Markup.inlineKeyboard(buttons);
+};
+
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
@@ -339,18 +341,3 @@ export default async function handler(req, res) {
         return res.status(500).send('Error');
     }
 }
-
-const getJoinButtons = async (ctx, payload) => {
-    // (Existing Join Logic)
-    const buttons = [];
-    for (const id of FORCE_SUB_IDS) {
-        try {
-            const chat = await ctx.telegram.getChat(id);
-            const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
-            buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
-        } catch (e) {}
-    }
-    const cb = payload ? `checksub_${payload}` : 'checksub_home';
-    buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
-    return Markup.inlineKeyboard(buttons);
-};
