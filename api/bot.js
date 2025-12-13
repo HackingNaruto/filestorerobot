@@ -1,4 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
+const FormData = require('form-data');
+// Node 18+ has native fetch, but for safety in some envs we use standard handling
 
 // --- CONFIGURATION ---
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -7,19 +9,15 @@ const ADMIN_ID = Number(process.env.ADMIN_ID);
 const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
 // --- MEMORY STORAGE ---
-global.batchStorage = global.batchStorage || {}; // Stores files
+global.batchStorage = global.batchStorage || {}; 
 global.shortenerConfig = global.shortenerConfig || {
     domain: process.env.SHORTENER_DOMAIN || "", 
     key: process.env.SHORTENER_KEY || ""
 };
-global.awaitingShortenerConfig = global.awaitingShortenerConfig || {}; 
-
-// --- ERROR HANDLING ---
-bot.catch((err, ctx) => {
-    console.error(`Error`, err);
-});
+global.telegraphToken = global.telegraphToken || ""; // Stores temp token
 
 // --- HELPERS ---
+
 const encodePayload = (msgId) => {
     const text = `File_${msgId}_Secure`; 
     return Buffer.from(text).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_'); 
@@ -44,6 +42,9 @@ const cleanCaption = (text) => {
     return clean.trim();
 };
 
+// --- API FUNCTIONS ---
+
+// 1. URL Shortener
 const getShortLink = async (longUrl) => {
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return null;
     try {
@@ -52,8 +53,63 @@ const getShortLink = async (longUrl) => {
         const data = await response.json();
         if (data.status === 'success' || data.shortenedUrl) return data.shortenedUrl;
         return null;
-    } catch (error) {
-        return null; 
+    } catch (error) { return null; }
+};
+
+// 2. Upload to Catbox
+const uploadToCatbox = async (fileUrl) => {
+    try {
+        // Fetch file from Telegram
+        const fileRes = await fetch(fileUrl);
+        const buffer = await fileRes.arrayBuffer();
+        
+        const form = new FormData();
+        form.append('reqtype', 'fileupload');
+        form.append('fileToUpload', Buffer.from(buffer), 'image.jpg');
+
+        const response = await fetch('https://catbox.moe/user/api.php', {
+            method: 'POST',
+            body: form
+        });
+        
+        const text = await response.text();
+        if (text.startsWith('http')) return text;
+        return null;
+    } catch (e) {
+        console.error("Catbox Error:", e);
+        return null;
+    }
+};
+
+// 3. Create Telegraph Page
+const createTelegraphPage = async (title, nodes) => {
+    try {
+        // Create Account if not exists
+        if (!global.telegraphToken) {
+            const accRes = await fetch(`https://api.telegra.ph/createAccount?short_name=FileBot&author_name=Admin`);
+            const accData = await accRes.json();
+            if (accData.ok) global.telegraphToken = accData.result.access_token;
+        }
+
+        // Create Page
+        const contentStr = JSON.stringify(nodes);
+        const response = await fetch('https://api.telegra.ph/createPage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                access_token: global.telegraphToken,
+                title: title,
+                content: contentStr,
+                return_content: true
+            })
+        });
+        
+        const data = await response.json();
+        if (data.ok) return data.result.url;
+        return null;
+    } catch (e) {
+        console.error("Telegraph Error:", e);
+        return null;
     }
 };
 
@@ -61,32 +117,156 @@ const getShortLink = async (longUrl) => {
 const getAdminKeyboard = () => {
     return Markup.inlineKeyboard([
         [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')],
-        [Markup.button.callback(`📤 Process Queue`, 'batch_show_original')],
+        [Markup.button.callback(`📝 Create Graph.org Page`, 'batch_create_graph')], // New Button
         [Markup.button.callback(`❌ Clear Queue`, 'batch_clear')]
     ]);
 };
 
-// Button to trigger Shortening
-const getShortenButton = () => {
-    return Markup.inlineKeyboard([
-        [Markup.button.callback('✂️ Shorten Now', 'transform_to_short')]
-    ]);
-};
+// --- HANDLERS ---
 
-const getJoinButtons = async (ctx, payload) => {
-    const buttons = [];
-    for (const id of FORCE_SUB_IDS) {
-        try {
-            const chat = await ctx.telegram.getChat(id);
-            const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
-            buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
-        } catch (e) {}
+bot.action('batch_clear', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    delete global.batchStorage[ctx.from.id];
+    await ctx.reply("🗑 Queue Cleared!", getAdminKeyboard());
+});
+
+bot.action('admin_shortener', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    global.awaitingShortenerConfig[ctx.from.id] = true;
+    await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
+});
+
+// --- 🔥 MAIN LOGIC: PROCESS BATCH & CREATE GRAPH 🔥 ---
+bot.action('batch_create_graph', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
+
+    const userData = global.batchStorage[ctx.from.id];
+    if (!userData || (!userData.files.length && !userData.poster)) {
+        return ctx.reply('⚠️ Queue empty. Send files and an image (optional).');
     }
-    const cb = payload ? `checksub_${payload}` : 'checksub_home';
-    buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
-    return Markup.inlineKeyboard(buttons);
-};
 
+    if (!global.shortenerConfig.domain || !global.shortenerConfig.key) {
+        return ctx.reply('⚠️ Shortener not configured!');
+    }
+
+    await ctx.reply("⏳ Processing... Uploading Image & Shortening Links...");
+
+    // 1. Prepare Content for Telegraph
+    let domNodes = [];
+
+    // Add Poster Image (If exists)
+    if (userData.poster) {
+        domNodes.push({
+            tag: 'img',
+            attrs: { src: userData.poster }
+        });
+        domNodes.push({ tag: 'br' });
+    }
+
+    // Add Title/Header
+    domNodes.push({ tag: 'h3', children: ['📂 Download Files'] });
+    domNodes.push({ tag: 'hr' });
+
+    // 2. Process Files (Shorten Links)
+    for (const file of userData.files) {
+        const shortLink = await getShortLink(file.longLink) || file.longLink;
+        
+        // Structure: 
+        // File Name (Bold)
+        // Link (Clickable)
+        domNodes.push({ 
+            tag: 'p', 
+            children: [
+                { tag: 'b', children: [file.caption] },
+                { tag: 'br' },
+                { tag: 'a', attrs: { href: shortLink }, children: ['📥 Download/Watch Here'] }
+            ]
+        });
+        domNodes.push({ tag: 'br' });
+    }
+
+    // Add Footer
+    domNodes.push({ tag: 'hr' });
+    domNodes.push({ tag: 'i', children: ['Created by FileStore Bot'] });
+
+    // 3. Publish to Telegraph
+    const pageTitle = userData.files[0] ? userData.files[0].caption : "File Collection";
+    const graphUrl = await createTelegraphPage(pageTitle, domNodes);
+
+    if (graphUrl) {
+        await ctx.reply(`✅ **Graph Page Created!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
+        // Clear queue
+        delete global.batchStorage[ctx.from.id];
+    } else {
+        await ctx.reply("❌ Failed to create Graph page. Try again.");
+    }
+});
+
+
+// --- ADMIN UPLOAD HANDLERS ---
+
+// 1. Handle PHOTOS (Poster Image)
+bot.on('photo', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+
+    await ctx.reply("🖼 Uploading image to Catbox... Wait...");
+
+    try {
+        // Get highest resolution photo
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
+        const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+        
+        // Upload to Catbox
+        const catboxUrl = await uploadToCatbox(fileLink.href);
+
+        if (catboxUrl) {
+            if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
+            global.batchStorage[ctx.from.id].poster = catboxUrl;
+            
+            await ctx.reply(`✅ **Poster Set!**\nURL: ${catboxUrl}\n\nNow send files to add to this page.`, getAdminKeyboard());
+        } else {
+            await ctx.reply("❌ Catbox Upload Failed.");
+        }
+    } catch (e) {
+        console.error(e);
+        ctx.reply("❌ Error processing image.");
+    }
+});
+
+// 2. Handle FILES (Movies/Docs)
+bot.on(['document', 'video', 'audio'], async (ctx) => {
+    if (!ctx.from) return; 
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
+    
+    try {
+        const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
+        const code = encodePayload(sent.message_id);
+        const longLink = `https://t.me/${ctx.botInfo.username}?start=${code}`;
+        
+        let rawCap = ctx.message.caption || "";
+        if (!rawCap && ctx.message.document) rawCap = ctx.message.document.file_name;
+        if (!rawCap && ctx.message.video) rawCap = ctx.message.video.file_name;
+        if (!rawCap && ctx.message.audio) rawCap = ctx.message.audio.file_name;
+        if (!rawCap) rawCap = "Untitled File";
+        const safeName = cleanCaption(rawCap);
+
+        // Store in Queue
+        if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
+        
+        global.batchStorage[ctx.from.id].files.push({
+            caption: safeName,
+            longLink: longLink
+        });
+
+        const count = global.batchStorage[ctx.from.id].files.length;
+        if (count === 1) {
+            await ctx.reply(`📥 **Batch Started.**\n\nSend Image (Poster) -> Send Files -> Click 'Create Graph'`, getAdminKeyboard());
+        }
+
+    } catch (e) { ctx.reply('❌ DB Channel Error.'); }
+});
+
+// --- STANDARD CONFIG & START ---
 const checkForceSub = async (ctx, userId) => {
     if (!userId) return true;
     if (userId === ADMIN_ID) return true;
@@ -100,104 +280,6 @@ const checkForceSub = async (ctx, userId) => {
     return true;
 };
 
-// --- ADMIN ACTIONS ---
-bot.action('admin_shortener', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    global.awaitingShortenerConfig[ctx.from.id] = true;
-    const current = global.shortenerConfig.domain ? `✅ Active: ${global.shortenerConfig.domain}` : "❌ Not Set";
-    await ctx.reply(`⚙️ Shortener Config\nStatus: ${current}\n\nSend: domain.com | api_key`);
-});
-
-bot.action('batch_clear', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    delete global.batchStorage[ctx.from.id];
-    await ctx.reply("🗑 Queue Cleared!", getAdminKeyboard());
-});
-
-// --- STEP 1: SHOW ORIGINAL LINKS ---
-bot.action('batch_show_original', async (ctx) => {
-    await showOriginalBatch(ctx);
-});
-bot.command('batch', async (ctx) => {
-    await showOriginalBatch(ctx);
-});
-
-async function showOriginalBatch(ctx) {
-    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
-    
-    const files = global.batchStorage[ctx.from.id];
-    if (!files || files.length === 0) return ctx.reply('⚠️ Queue is empty! Send files first.');
-
-    await ctx.reply(`⏳ Generating Original Links...`);
-
-    let finalMessage = "";
-    for (const file of files) {
-        // Output: Caption + Original Link
-        finalMessage += `${file.caption}\n${file.longLink}\n\n`;
-    }
-
-    try {
-        // Send message with "Shorten Now" button
-        await ctx.reply(finalMessage, { 
-            disable_web_page_preview: true,
-            ...getShortenButton() 
-        });
-        
-        // Clear queue after showing original links? 
-        // Better to keep it until they shorten, but for simplicity let's clear it 
-        // because the message is already sent.
-        delete global.batchStorage[ctx.from.id];
-
-    } catch (e) {
-        ctx.reply(`❌ Error (Message too long?): ${e.message}`);
-    }
-}
-
-// --- STEP 2: CLICK BUTTON -> CONVERT TO SHORT LINKS ---
-bot.action('transform_to_short', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
-    
-    // Check Config
-    if (!global.shortenerConfig.domain || !global.shortenerConfig.key) {
-        return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
-    }
-
-    await ctx.answerCbQuery('⏳ Shortening links...');
-
-    const originalText = ctx.callbackQuery.message.text;
-    if (!originalText) return;
-
-    // 1. Find all Telegram Links
-    const matches = [...originalText.matchAll(/https:\/\/t\.me\/[^\s]+/g)];
-    if (matches.length === 0) return ctx.answerCbQuery('No links found');
-
-    // 2. Get unique URLs (to save API calls)
-    const uniqueUrls = [...new Set(matches.map(m => m[0]))];
-    const shortLinksMap = {};
-
-    // 3. Parallel Shortening
-    await Promise.all(uniqueUrls.map(async (longUrl) => {
-        const short = await getShortLink(longUrl);
-        if (short) shortLinksMap[longUrl] = short;
-    }));
-
-    // 4. Replace Links in Text
-    let newText = originalText;
-    for (const longUrl of uniqueUrls) {
-        if (shortLinksMap[longUrl]) {
-            // Global replace of this URL
-            newText = newText.split(longUrl).join(shortLinksMap[longUrl]);
-        }
-    }
-
-    // 5. Edit the Message
-    try {
-        await ctx.editMessageText(newText, { disable_web_page_preview: true });
-    } catch (e) {
-        ctx.reply(`❌ Update Error: ${e.message}`);
-    }
-});
-
 bot.action(/checksub_(.+)/, async (ctx) => {
     const pl = ctx.match[1];
     if (await checkForceSub(ctx, ctx.from.id)) {
@@ -209,75 +291,25 @@ bot.action(/checksub_(.+)/, async (ctx) => {
     } else await ctx.answerCbQuery('⚠️ Join first!', { show_alert: true });
 });
 
-// --- ADMIN UPLOAD (COLLECT ONLY) ---
-bot.on(['document', 'video', 'audio'], async (ctx) => {
-    if (!ctx.from) return; 
-    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
-    
-    try {
-        // 1. Copy to Channel
-        const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
-        
-        // 2. Generate Long Link
-        const code = encodePayload(sent.message_id);
-        const longLink = `https://t.me/${ctx.botInfo.username}?start=${code}`;
-        
-        // 3. Clean Caption
-        let rawCap = ctx.message.caption || "";
-        if (!rawCap && ctx.message.document) rawCap = ctx.message.document.file_name;
-        if (!rawCap && ctx.message.video) rawCap = ctx.message.video.file_name;
-        if (!rawCap && ctx.message.audio) rawCap = ctx.message.audio.file_name;
-        if (!rawCap) rawCap = "Untitled File";
-        const safeName = cleanCaption(rawCap);
-
-        // 4. ADD TO QUEUE
-        if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
-        
-        global.batchStorage[ctx.from.id].push({
-            caption: safeName,
-            longLink: longLink
-        });
-
-        // 5. Feedback (Optional - prevents spamming)
-        const count = global.batchStorage[ctx.from.id].length;
-        if (count === 1) {
-            await ctx.reply(`📥 Queue Started.\n\nSend all files, then click "Process Queue".`, getAdminKeyboard());
-        }
-
-    } catch (e) { 
-        ctx.reply('❌ DB Channel Error.');
-    }
-});
-
-// --- START & TEXT ---
 bot.start(async (ctx) => {
     try {
         const pl = ctx.payload;
-        // User requesting file
         if (pl) {
-            if (!await checkForceSub(ctx, ctx.from.id)) {
-                return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
-            }
+            if (!await checkForceSub(ctx, ctx.from.id)) return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
             const id = decodePayload(pl);
             if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File missing.'); }
             else ctx.reply('❌ Invalid Link.');
             return;
         }
-
-        // Admin Panel
         if (ctx.from.id === ADMIN_ID) {
-            const count = global.batchStorage[ctx.from.id] ? global.batchStorage[ctx.from.id].length : 0;
-            await ctx.reply(`👋 <b>Admin Panel</b>\nFiles in Queue: ${count}`, { parse_mode: 'HTML', ...getAdminKeyboard() });
+            const userData = global.batchStorage[ctx.from.id];
+            const count = userData ? userData.files.length : 0;
+            const hasPoster = userData && userData.poster ? "✅ Set" : "❌ Not Set";
+            await ctx.reply(`👋 <b>Admin Panel</b>\nFiles: ${count}\nPoster: ${hasPoster}`, { parse_mode: 'HTML', ...getAdminKeyboard() });
         } else {
-            if (!await checkForceSub(ctx, ctx.from.id)) {
-                return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, '') });
-            }
             ctx.reply('🤖 Send me a link.');
         }
-
-    } catch (e) {
-        ctx.reply(`Start Error: ${e.message}`);
-    }
+    } catch (e) {}
 });
 
 bot.on('text', async (ctx) => {
@@ -288,13 +320,12 @@ bot.on('text', async (ctx) => {
             const [domain, key] = text.split('|').map(s => s.trim());
             global.shortenerConfig = { domain, key };
             global.awaitingShortenerConfig[ctx.from.id] = false;
-            await ctx.reply(`✅ Configured: ${domain}`);
-            return ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard());
+            await ctx.reply(`✅ Configured: ${domain}`, getAdminKeyboard());
         }
-        return ctx.reply('❌ Format: domain.com | api_key');
     }
 });
 
+// Vercel Handler
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
@@ -308,3 +339,18 @@ export default async function handler(req, res) {
         return res.status(500).send('Error');
     }
 }
+
+const getJoinButtons = async (ctx, payload) => {
+    // (Existing Join Logic)
+    const buttons = [];
+    for (const id of FORCE_SUB_IDS) {
+        try {
+            const chat = await ctx.telegram.getChat(id);
+            const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
+            buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
+        } catch (e) {}
+    }
+    const cb = payload ? `checksub_${payload}` : 'checksub_home';
+    buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
+    return Markup.inlineKeyboard(buttons);
+};
