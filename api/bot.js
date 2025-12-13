@@ -17,39 +17,36 @@ global.awaitingShortenerConfig = global.awaitingShortenerConfig || {};
 
 // --- ERROR HANDLING ---
 bot.catch((err, ctx) => {
-    console.error(`Error for ${ctx.updateType}`, err);
+    console.error(`Error`, err);
 });
 
 // --- HELPERS ---
 const encodePayload = (msgId) => {
     const text = `File_${msgId}_Secure`; 
-    return Buffer.from(text).toString('base64').replace(/=/g, ''); 
+    return Buffer.from(text).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_'); 
 };
 
 const decodePayload = (code) => {
     try {
-        const text = Buffer.from(code, 'base64').toString('utf-8');
+        let base64 = code.replace(/-/g, '+').replace(/_/g, '/');
+        const text = Buffer.from(base64, 'base64').toString('utf-8');
         const parts = text.split('_');
         if (parts[0] === 'File' && parts[2] === 'Secure') return parseInt(parts[1]);
         return null;
     } catch (e) { return null; }
 };
 
-const escapeHTML = (text) => {
-    if (!text) return "";
-    return String(text)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-};
-
 const cleanCaption = (text) => {
     if (!text) return "Untitled File";
-    return String(text)
+    // Remove specific unwanted lines
+    let clean = String(text)
         .replace(/⭕️ Main Channel : @StarFlixTamil ⭕️/g, "")
-        .replace(/@[\w_]+/g, "")
-        .replace(/(Main Channel|Join Channel).*/gi, "")
-        .trim();
+        .replace(/(Main Channel|Join Channel).*/gi, "");
+    
+    // Remove standalone @usernames
+    clean = clean.replace(/@[\w_]+/g, "");
+    
+    return clean.trim();
 };
 
 const getGroupId = (text) => {
@@ -127,7 +124,7 @@ bot.action('admin_shortener', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     global.awaitingShortenerConfig[ctx.from.id] = true;
     const current = global.shortenerConfig.domain ? `✅ Active: ${global.shortenerConfig.domain}` : "❌ Not Set";
-    await ctx.reply(`⚙️ <b>Shortener Config</b>\nStatus: ${current}\n\nSend: <code>domain.com | api_key</code>`, { parse_mode: 'HTML' });
+    await ctx.reply(`⚙️ Shortener Config\nStatus: ${current}\n\nSend: domain.com | api_key`);
 });
 
 bot.action(/shorten_(.+)/, async (ctx) => {
@@ -142,71 +139,62 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     
     if (shortLink) {
         const msgText = ctx.callbackQuery.message.text || "";
-        const lines = msgText.split('\n');
-        const captionLines = lines.filter(line => !line.includes('t.me/'));
-        const caption = captionLines.join('\n').trim() || "File";
-
-        await ctx.reply(
-            `<b>${escapeHTML(caption)}</b>\n${shortLink}`, 
-            { parse_mode: 'HTML', disable_web_page_preview: true }
-        );
+        // Extract caption by removing the link line
+        const caption = msgText.replace(/https:\/\/t\.me\/[^\s]+/, "").trim() || "File";
+        
+        // NO HTML, JUST PLAIN TEXT
+        await ctx.reply(`${caption}\n${shortLink}`, { disable_web_page_preview: true });
     } else {
         await ctx.answerCbQuery('❌ API Error.', { show_alert: true });
     }
 });
 
-// --- 🔥 FIXED BATCH SHORTENER LOGIC (SCANNER METHOD) 🔥 ---
+// --- 🔥 FINAL ROBUST BATCH SHORTENER 🔥 ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing (This may take a moment)...');
+    await ctx.answerCbQuery('⏳ Processing...');
     
-    const originalText = ctx.callbackQuery.message.text;
-    if (!originalText) return;
+    const text = ctx.callbackQuery.message.text;
+    if (!text) return;
 
-    // 1. Find all links and their positions
-    // This Regex finds all Telegram Bot Links
-    const urlRegex = /(https:\/\/t\.me\/[^\s]+)/g;
-    let match;
+    // 1. Find all Telegram Links
+    const matches = [...text.matchAll(/https:\/\/t\.me\/[^\s]+/g)];
+    if (matches.length === 0) return ctx.answerCbQuery('No links found');
+
+    let finalMessage = "";
     let lastIndex = 0;
-    let newBlocks = [];
 
-    // Loop through every link found
-    while ((match = urlRegex.exec(originalText)) !== null) {
-        const longLink = match[0];
-        const linkStartIndex = match.index;
+    for (const match of matches) {
+        const url = match[0];
+        const startIndex = match.index;
 
-        // 2. Get the Caption (Text BEFORE this link, up to the previous link)
-        let captionRaw = originalText.substring(lastIndex, linkStartIndex).trim();
-        
-        // Clean up the caption (remove Short: tags if re-running)
-        captionRaw = captionRaw.replace('✂️', '').replace('Short:', '').trim();
+        // 2. Get text BEFORE the link (This is the Caption)
+        // We trim it to remove extra newlines
+        let caption = text.substring(lastIndex, startIndex).trim();
 
-        // 3. Shorten the link
-        const shortLink = await getShortLink(longLink);
-        
-        // 4. Format: Bold Caption + Short Link (or original if failed)
-        if (shortLink) {
-            newBlocks.push(`<b>${escapeHTML(captionRaw)}</b>\n${shortLink}`);
+        // 3. Shorten
+        const short = await getShortLink(url);
+        const linkToShow = short || url; // Fallback to original if fail
+
+        // 4. Build Output (Plain Text)
+        // If caption exists, print it. If empty (rare), just print link.
+        if (caption) {
+            finalMessage += `${caption}\n${linkToShow}\n\n`;
         } else {
-            newBlocks.push(`<b>${escapeHTML(captionRaw)}</b>\n${longLink}`);
+            finalMessage += `${linkToShow}\n\n`;
         }
 
-        // Update index for next loop
-        lastIndex = linkStartIndex + longLink.length;
+        // Move cursor forward
+        lastIndex = startIndex + url.length;
     }
 
-    // If no links found, exit
-    if (newBlocks.length === 0) return ctx.answerCbQuery('⚠️ No links found.');
-
-    // 5. Send as NEW Message
-    const finalMessage = newBlocks.join('\n\n');
-    
     try {
-        await ctx.reply(finalMessage, { parse_mode: 'HTML', disable_web_page_preview: true });
+        // Send as Plain Text (No Parse Mode = No Errors)
+        await ctx.reply(finalMessage, { disable_web_page_preview: true });
     } catch (e) { 
-        ctx.reply(`❌ Error sending new message: ${e.message}`); 
+        ctx.reply(`Error: ${e.message}`); 
     }
 });
 
@@ -217,7 +205,7 @@ bot.action('admin_switch', async (ctx) => {
     global.userModes[ctx.from.id] = next;
     if (next === 'single') delete global.batchStorage[ctx.from.id];
     const count = global.batchStorage[ctx.from.id] ? global.batchStorage[ctx.from.id].length : 0;
-    await ctx.editMessageText(`⚙️ <b>Admin Panel</b>\nMode: <b>${next.toUpperCase()}</b>\nQueue: ${count}`, { parse_mode: 'HTML', ...getAdminKeyboard(next, count) });
+    await ctx.editMessageText(`⚙️ Admin Panel\nMode: ${next.toUpperCase()}\nQueue: ${count}`, getAdminKeyboard(next, count));
 });
 
 bot.action('admin_process', async (ctx) => {
@@ -236,11 +224,12 @@ bot.action('admin_process', async (ctx) => {
     for (const k in groups) {
         let txt = "";
         groups[k].forEach(f => {
-            const safeName = escapeHTML(cleanCaption(f.raw_caption));
-            txt += `<b>${safeName}</b>\n${f.link}\n\n`;
+            const safeName = cleanCaption(f.raw_caption);
+            txt += `${safeName}\n${f.link}\n\n`;
         });
-        try { await ctx.reply(txt, { parse_mode: 'HTML', disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
-            ctx.reply(`❌ Group Error: ${e.message}`);
+        // Plain text output for initial list too
+        try { await ctx.reply(txt, { disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
+            ctx.reply(`Error sending group: ${e.message}`);
         }
     }
     delete global.batchStorage[ctx.from.id];
@@ -251,7 +240,7 @@ bot.action('admin_clear', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     delete global.batchStorage[ctx.from.id];
     const mode = global.userModes[ctx.from.id] || 'batch';
-    await ctx.editMessageText(`⚙️ <b>Admin Panel</b>\nBatch Cleared!`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
+    await ctx.editMessageText(`⚙️ Admin Panel\nBatch Cleared!`, getAdminKeyboard(mode, 0));
 });
 
 bot.action(/checksub_(.+)/, async (ctx) => {
@@ -282,8 +271,9 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
         if (!rawCap) rawCap = "Untitled File";
 
         if (mode === 'single') {
-            const safeName = escapeHTML(cleanCaption(rawCap));
-            await ctx.reply(`<b>${safeName}</b>\n${link}`, { parse_mode: 'HTML', disable_web_page_preview: true, ...getFileControls(code) });
+            const safeName = cleanCaption(rawCap);
+            // Plain text
+            await ctx.reply(`${safeName}\n${link}`, { disable_web_page_preview: true, ...getFileControls(code) });
         } else {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
             global.batchStorage[ctx.from.id].push({ raw_caption: rawCap, link: link });
@@ -299,7 +289,7 @@ bot.start(async (ctx) => {
     try {
         const pl = ctx.payload;
         if (!await checkForceSub(ctx, ctx.from.id)) {
-            return ctx.reply('⚠️ <b>Access Denied</b>', { parse_mode: 'HTML', ...await getJoinButtons(ctx, pl) });
+            return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
         }
         
         if (pl) {
@@ -309,7 +299,7 @@ bot.start(async (ctx) => {
         } else {
             if (ctx.from.id === ADMIN_ID) {
                 const mode = global.userModes[ctx.from.id] || 'batch';
-                await ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
+                await ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard(mode, 0));
             } else {
                 ctx.reply('🤖 Send me a link.');
             }
@@ -327,14 +317,13 @@ bot.on('text', async (ctx) => {
             const [domain, key] = text.split('|').map(s => s.trim());
             global.shortenerConfig = { domain, key };
             global.awaitingShortenerConfig[ctx.from.id] = false;
-            await ctx.reply(`✅ <b>Configured:</b> ${domain}`, { parse_mode: 'HTML' });
-            return ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0) });
+            await ctx.reply(`✅ Configured: ${domain}`);
+            return ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0));
         }
         return ctx.reply('❌ Format: domain.com | api_key');
     }
 });
 
-// --- HANDLER ---
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
