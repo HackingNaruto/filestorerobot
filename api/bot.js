@@ -18,11 +18,6 @@ global.awaitingShortenerConfig = global.awaitingShortenerConfig || {};
 // --- ERROR HANDLING ---
 bot.catch((err, ctx) => {
     console.error(`Error for ${ctx.updateType}`, err);
-    const errMessage = err.message || "Unknown Error";
-    if (ctx && ctx.reply) {
-        // Silent catch to prevent spamming chat, but log it.
-        // ctx.reply(`⚠️ Error: ${errMessage}`).catch(() => {});
-    }
 });
 
 // --- HELPERS ---
@@ -79,7 +74,6 @@ const getShortLink = async (longUrl) => {
 
 // --- KEYBOARDS ---
 const getAdminKeyboard = (mode, count) => {
-    // SAFETY FIX: If mode is undefined, default to 'BATCH'
     const safeMode = mode || 'batch';
     return Markup.inlineKeyboard([
         [Markup.button.callback(`🔄 Mode: ${safeMode.toUpperCase()}`, 'admin_switch')],
@@ -97,7 +91,7 @@ const getFileControls = (shortCode) => {
 
 const getBatchControls = () => {
     return Markup.inlineKeyboard([
-        [Markup.button.callback('✂️ Shorten All Links (New Msg)', 'batch_shorten_all')]
+        [Markup.button.callback('✂️ Shorten All Links', 'batch_shorten_all')]
     ]);
 };
 
@@ -136,6 +130,7 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ <b>Shortener Config</b>\nStatus: ${current}\n\nSend: <code>domain.com | api_key</code>`, { parse_mode: 'HTML' });
 });
 
+// --- SINGLE FILE SHORTENER FIX ---
 bot.action(/shorten_(.+)/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     const code = ctx.match[1];
@@ -147,8 +142,17 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     const shortLink = await getShortLink(longLink);
     
     if (shortLink) {
+        // FIX: Get Caption from Message TEXT (because bot reply is text, not caption)
+        const msgText = ctx.callbackQuery.message.text || "";
+        // Remove the old link from text to get just the caption
+        // Assuming format is: "Caption \n https://t.me/..."
+        const lines = msgText.split('\n');
+        // Filter out the line containing the telegram link
+        const captionLines = lines.filter(line => !line.includes('t.me/'));
+        const caption = captionLines.join('\n').trim() || "File";
+
         await ctx.reply(
-            `<b>${escapeHTML(ctx.callbackQuery.message.caption || "File")}</b>\n${shortLink}`, 
+            `<b>${escapeHTML(caption)}</b>\n${shortLink}`, 
             { parse_mode: 'HTML', disable_web_page_preview: true }
         );
     } else {
@@ -156,11 +160,12 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
+// --- BATCH SHORTENER FIX ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Generating new message with short links...');
+    await ctx.answerCbQuery('⏳ Generating new message...');
     
     let originalText = ctx.callbackQuery.message.text;
     if (!originalText) return;
@@ -219,7 +224,6 @@ bot.action('admin_process', async (ctx) => {
         }
     }
     delete global.batchStorage[ctx.from.id];
-    // FIX APPLIED HERE: Added "|| 'batch'" to prevent undefined error
     await ctx.reply('✅ Done!', getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0));
 });
 
@@ -266,7 +270,6 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
             await ctx.reply(`📥 Added (${global.batchStorage[ctx.from.id].length})`);
         }
     } catch (e) { 
-        // Log silently or simple reply
         ctx.reply('❌ DB Channel Error.');
     }
 });
@@ -285,7 +288,6 @@ bot.start(async (ctx) => {
             else ctx.reply('❌ Invalid Link.');
         } else {
             if (ctx.from.id === ADMIN_ID) {
-                // FIX APPLIED HERE: Added "|| 'batch'"
                 const mode = global.userModes[ctx.from.id] || 'batch';
                 await ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
             } else {
