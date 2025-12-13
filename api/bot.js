@@ -6,8 +6,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
-// --- MEMORY STORAGE (Global Variables) ---
-// Note: In Vercel, these might reset after some time of inactivity.
+// --- MEMORY STORAGE ---
 global.userModes = global.userModes || {};     
 global.batchStorage = global.batchStorage || {};
 global.shortenerConfig = global.shortenerConfig || {
@@ -16,17 +15,19 @@ global.shortenerConfig = global.shortenerConfig || {
 };
 global.awaitingShortenerConfig = global.awaitingShortenerConfig || {}; 
 
-// --- ERROR HANDLING (Prevents Bot from going Silent) ---
+// --- DEBUG ERROR HANDLING ---
+// Idhu thaan mukkiyam. Error enna nu ungalukku chat-la sollum.
 bot.catch((err, ctx) => {
-    console.error(`Ooops, encountered an error for ${ctx.updateType}`, err);
-    // Try to tell the user something went wrong
-    try {
-        ctx.reply("❌ Error occurred! Check Vercel Logs.");
-    } catch (e) {}
+    console.error(`Error for ${ctx.updateType}`, err);
+    const errMessage = err.message || "Unknown Error";
+    
+    // Send specific error to chat
+    if (ctx && ctx.reply) {
+        ctx.reply(`⚠️ <b>Internal Error:</b>\n<code>${errMessage}</code>\n\nTake a screenshot of this and send it to the developer.`, { parse_mode: 'HTML' }).catch(() => {});
+    }
 });
 
 // --- HELPERS ---
-
 const encodePayload = (msgId) => {
     const text = `File_${msgId}_Secure`; 
     return Buffer.from(text).toString('base64').replace(/=/g, ''); 
@@ -41,10 +42,9 @@ const decodePayload = (code) => {
     } catch (e) { return null; }
 };
 
-// CRITICAL FIX: Escapes HTML symbols to prevent crash
 const escapeHTML = (text) => {
     if (!text) return "";
-    return text
+    return String(text)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
@@ -52,7 +52,7 @@ const escapeHTML = (text) => {
 
 const cleanCaption = (text) => {
     if (!text) return "Untitled File";
-    return text
+    return String(text)
         .replace(/⭕️ Main Channel : @StarFlixTamil ⭕️/g, "")
         .replace(/@[\w_]+/g, "")
         .replace(/(Main Channel|Join Channel).*/gi, "")
@@ -69,20 +69,17 @@ const getGroupId = (text) => {
 const getShortLink = async (longUrl) => {
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return null;
     try {
-        // Using built-in fetch (Node 18+)
         const apiUrl = `https://${global.shortenerConfig.domain}/api?api=${global.shortenerConfig.key}&url=${encodeURIComponent(longUrl)}`;
         const response = await fetch(apiUrl);
         const data = await response.json();
         if (data.status === 'success' || data.shortenedUrl) return data.shortenedUrl;
         return null;
     } catch (error) {
-        console.error("Shortener Error:", error);
-        return null;
+        return null; // Silent fail for shortener
     }
 };
 
 // --- KEYBOARDS ---
-
 const getAdminKeyboard = (mode, count) => {
     return Markup.inlineKeyboard([
         [Markup.button.callback(`🔄 Mode: ${mode.toUpperCase()}`, 'admin_switch')],
@@ -111,15 +108,35 @@ const getJoinButtons = async (ctx, payload) => {
             const chat = await ctx.telegram.getChat(id);
             const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
             buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
-        } catch (e) {}
+        } catch (e) {
+            // If ID is wrong, it fails here. Let's ignore bad IDs.
+        }
     }
     const cb = payload ? `checksub_${payload}` : 'checksub_home';
     buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
     return Markup.inlineKeyboard(buttons);
 };
 
-// --- ADMIN ACTIONS ---
+// --- CHECK FORCE SUB ---
+const checkForceSub = async (ctx, userId) => {
+    // Basic check to prevent crashes if ctx.from is missing
+    if (!userId) return true;
+    if (userId === ADMIN_ID) return true;
+    if (FORCE_SUB_IDS.length === 0) return true;
 
+    for (const channelId of FORCE_SUB_IDS) {
+        try {
+            const member = await ctx.telegram.getChatMember(channelId, userId);
+            if (['left', 'kicked', 'restricted'].includes(member.status)) return false;
+        } catch (err) {
+            // Ignore error if bot is not admin, just assume joined or skip
+            console.log(`ForceSub check failed for ${channelId}`);
+        }
+    }
+    return true;
+};
+
+// --- ADMIN ACTIONS ---
 bot.action('admin_shortener', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     global.awaitingShortenerConfig[ctx.from.id] = true;
@@ -144,7 +161,7 @@ bot.action(/shorten_(.+)/, async (ctx) => {
         try {
             if (ctx.callbackQuery.message.caption) await ctx.editMessageCaption(newText, { parse_mode: 'HTML' });
             else await ctx.editMessageText(newText, { parse_mode: 'HTML', disable_web_page_preview: true });
-        } catch(e) { console.error(e); }
+        } catch(e) {}
     } else {
         await ctx.answerCbQuery('❌ API Error.', { show_alert: true });
     }
@@ -154,8 +171,7 @@ bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing all links...');
-    
+    await ctx.answerCbQuery('⏳ Processing links...');
     let text = ctx.callbackQuery.message.text;
     if (!text) return;
 
@@ -165,9 +181,7 @@ bot.action('batch_shorten_all', async (ctx) => {
     if (!matches) return ctx.answerCbQuery('⚠️ No links found.');
 
     for (const longUrl of matches) {
-        // Skip if already shortened (check if next line is 'Short:')
         if (text.includes(longUrl + "\n✂️")) continue;
-
         const shortUrl = await getShortLink(longUrl);
         if (shortUrl) {
             text = text.replace(longUrl, `${longUrl}\n✂️ <b>Short:</b> ${shortUrl}`);
@@ -176,9 +190,8 @@ bot.action('batch_shorten_all', async (ctx) => {
 
     try {
         await ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true });
-    } catch (e) { ctx.reply('❌ Error updating message.'); }
+    } catch (e) { ctx.reply(`❌ Update Error: ${e.message}`); }
 });
-
 
 bot.action('admin_switch', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
@@ -210,7 +223,7 @@ bot.action('admin_process', async (ctx) => {
             txt += `<b>${safeName}</b>\n${f.link}\n\n`;
         });
         try { await ctx.reply(txt, { parse_mode: 'HTML', disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
-            ctx.reply(`❌ HTML Error in group: ${k}. Check filenames for special symbols.`);
+            ctx.reply(`❌ Group Error: ${e.message}`);
         }
     }
     delete global.batchStorage[ctx.from.id];
@@ -237,6 +250,7 @@ bot.action(/checksub_(.+)/, async (ctx) => {
 
 // --- ADMIN UPLOAD ---
 bot.on(['document', 'video', 'audio'], async (ctx) => {
+    if (!ctx.from) return; // Prevent crash on channel posts
     if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
     try {
         const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
@@ -259,33 +273,43 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
             await ctx.reply(`📥 Added (${global.batchStorage[ctx.from.id].length})`);
         }
     } catch (e) { 
-        console.error(e);
-        await ctx.reply('❌ DB Channel Error: Check Channel ID & Admin Rights.'); 
+        throw new Error(`Upload Failed: ${e.message} (Check Channel ID)`);
     }
 });
 
 // --- START & TEXT ---
 bot.start(async (ctx) => {
-    const pl = ctx.payload;
-    if (!await checkForceSub(ctx, ctx.from.id)) {
-        return ctx.reply('⚠️ <b>Access Denied</b>', { parse_mode: 'HTML', ...await getJoinButtons(ctx, pl) });
-    }
-    
-    if (pl) {
-        const id = decodePayload(pl);
-        if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File missing.'); }
-        else ctx.reply('❌ Invalid Link.');
-    } else {
-        if (ctx.from.id === ADMIN_ID) {
-            const mode = global.userModes[ctx.from.id] || 'batch';
-            await ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
-        } else {
-            ctx.reply('🤖 Send me a link.');
+    try {
+        const pl = ctx.payload;
+        if (!await checkForceSub(ctx, ctx.from.id)) {
+            return ctx.reply('⚠️ <b>Access Denied</b>', { parse_mode: 'HTML', ...await getJoinButtons(ctx, pl) });
         }
+        
+        if (pl) {
+            const id = decodePayload(pl);
+            if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File missing.'); }
+            else ctx.reply('❌ Invalid Link.');
+        } else {
+            if (ctx.from.id === ADMIN_ID) {
+                const mode = global.userModes[ctx.from.id] || 'batch';
+                await ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
+            } else {
+                ctx.reply('🤖 Send me a link.');
+            }
+        }
+    } catch (e) {
+        throw new Error(`Start Error: ${e.message}`);
     }
 });
 
+// --- DEBUG COMMAND ---
+bot.command('debug', (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    ctx.reply(`🛠 <b>Debug Info:</b>\nAdmin ID: ${ADMIN_ID}\nChannel: ${CHANNEL_ID}\nForceSub: ${FORCE_SUB_IDS.length} channels`, { parse_mode: 'HTML' });
+});
+
 bot.on('text', async (ctx) => {
+    if (!ctx.from) return;
     if (ctx.from.id === ADMIN_ID && global.awaitingShortenerConfig[ctx.from.id]) {
         const text = ctx.message.text;
         if (text.includes('|')) {
@@ -299,18 +323,17 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// --- VERCEL HANDLER (Strict) ---
+// --- HANDLER ---
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
-            // Ensure bot info is loaded (Critical for Vercel)
             if(!bot.botInfo) bot.botInfo = await bot.telegram.getMe();
             await bot.handleUpdate(req.body);
             return res.status(200).send('OK');
         }
         return res.status(200).send('Bot Active 🚀');
     } catch (e) {
-        console.error("Handler Error:", e);
+        console.error(e);
         return res.status(500).send('Error: ' + e.message);
     }
 }
