@@ -15,15 +15,13 @@ global.shortenerConfig = global.shortenerConfig || {
 };
 global.awaitingShortenerConfig = global.awaitingShortenerConfig || {}; 
 
-// --- DEBUG ERROR HANDLING ---
-// Idhu thaan mukkiyam. Error enna nu ungalukku chat-la sollum.
+// --- ERROR HANDLING ---
 bot.catch((err, ctx) => {
     console.error(`Error for ${ctx.updateType}`, err);
     const errMessage = err.message || "Unknown Error";
-    
-    // Send specific error to chat
     if (ctx && ctx.reply) {
-        ctx.reply(`⚠️ <b>Internal Error:</b>\n<code>${errMessage}</code>\n\nTake a screenshot of this and send it to the developer.`, { parse_mode: 'HTML' }).catch(() => {});
+        // Silent catch to prevent spamming chat, but log it.
+        // ctx.reply(`⚠️ Error: ${errMessage}`).catch(() => {});
     }
 });
 
@@ -75,14 +73,16 @@ const getShortLink = async (longUrl) => {
         if (data.status === 'success' || data.shortenedUrl) return data.shortenedUrl;
         return null;
     } catch (error) {
-        return null; // Silent fail for shortener
+        return null; 
     }
 };
 
 // --- KEYBOARDS ---
 const getAdminKeyboard = (mode, count) => {
+    // SAFETY FIX: If mode is undefined, default to 'BATCH'
+    const safeMode = mode || 'batch';
     return Markup.inlineKeyboard([
-        [Markup.button.callback(`🔄 Mode: ${mode.toUpperCase()}`, 'admin_switch')],
+        [Markup.button.callback(`🔄 Mode: ${safeMode.toUpperCase()}`, 'admin_switch')],
         [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')],
         [Markup.button.callback(`📤 Process Batch (${count})`, 'admin_process')],
         [Markup.button.callback(`❌ Clear Batch`, 'admin_clear')]
@@ -97,7 +97,7 @@ const getFileControls = (shortCode) => {
 
 const getBatchControls = () => {
     return Markup.inlineKeyboard([
-        [Markup.button.callback('✂️ Shorten All Links', 'batch_shorten_all')]
+        [Markup.button.callback('✂️ Shorten All Links (New Msg)', 'batch_shorten_all')]
     ]);
 };
 
@@ -108,30 +108,22 @@ const getJoinButtons = async (ctx, payload) => {
             const chat = await ctx.telegram.getChat(id);
             const link = chat.invite_link || `https://t.me/${chat.username.replace('@','')}`;
             buttons.push([Markup.button.url(`Join ${chat.title}`, link)]);
-        } catch (e) {
-            // If ID is wrong, it fails here. Let's ignore bad IDs.
-        }
+        } catch (e) {}
     }
     const cb = payload ? `checksub_${payload}` : 'checksub_home';
     buttons.push([Markup.button.callback('🔄 Verified / Try Again', cb)]);
     return Markup.inlineKeyboard(buttons);
 };
 
-// --- CHECK FORCE SUB ---
 const checkForceSub = async (ctx, userId) => {
-    // Basic check to prevent crashes if ctx.from is missing
     if (!userId) return true;
     if (userId === ADMIN_ID) return true;
     if (FORCE_SUB_IDS.length === 0) return true;
-
     for (const channelId of FORCE_SUB_IDS) {
         try {
             const member = await ctx.telegram.getChatMember(channelId, userId);
             if (['left', 'kicked', 'restricted'].includes(member.status)) return false;
-        } catch (err) {
-            // Ignore error if bot is not admin, just assume joined or skip
-            console.log(`ForceSub check failed for ${channelId}`);
-        }
+        } catch (err) {}
     }
     return true;
 };
@@ -155,13 +147,10 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     const shortLink = await getShortLink(longLink);
     
     if (shortLink) {
-        let newText = ctx.callbackQuery.message.text || ctx.callbackQuery.message.caption || "";
-        newText += `\n\n🔗 <b>Original:</b> ${longLink}\n✂️ <b>Short:</b> ${shortLink}`;
-        
-        try {
-            if (ctx.callbackQuery.message.caption) await ctx.editMessageCaption(newText, { parse_mode: 'HTML' });
-            else await ctx.editMessageText(newText, { parse_mode: 'HTML', disable_web_page_preview: true });
-        } catch(e) {}
+        await ctx.reply(
+            `<b>${escapeHTML(ctx.callbackQuery.message.caption || "File")}</b>\n${shortLink}`, 
+            { parse_mode: 'HTML', disable_web_page_preview: true }
+        );
     } else {
         await ctx.answerCbQuery('❌ API Error.', { show_alert: true });
     }
@@ -171,26 +160,29 @@ bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing links...');
-    let text = ctx.callbackQuery.message.text;
-    if (!text) return;
+    await ctx.answerCbQuery('⏳ Generating new message with short links...');
+    
+    let originalText = ctx.callbackQuery.message.text;
+    if (!originalText) return;
 
     const urlRegex = /(https:\/\/t\.me\/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9]+)/g;
-    const matches = text.match(urlRegex);
+    const matches = originalText.match(urlRegex);
 
     if (!matches) return ctx.answerCbQuery('⚠️ No links found.');
 
+    let newText = originalText; 
     for (const longUrl of matches) {
-        if (text.includes(longUrl + "\n✂️")) continue;
         const shortUrl = await getShortLink(longUrl);
         if (shortUrl) {
-            text = text.replace(longUrl, `${longUrl}\n✂️ <b>Short:</b> ${shortUrl}`);
+            newText = newText.replace(longUrl, shortUrl);
         }
     }
 
     try {
-        await ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true });
-    } catch (e) { ctx.reply(`❌ Update Error: ${e.message}`); }
+        await ctx.reply(newText, { parse_mode: 'HTML', disable_web_page_preview: true });
+    } catch (e) { 
+        ctx.reply(`❌ Error sending new message: ${e.message}`); 
+    }
 });
 
 bot.action('admin_switch', async (ctx) => {
@@ -227,7 +219,8 @@ bot.action('admin_process', async (ctx) => {
         }
     }
     delete global.batchStorage[ctx.from.id];
-    await ctx.reply('✅ Done!', getAdminKeyboard(global.userModes[ctx.from.id], 0));
+    // FIX APPLIED HERE: Added "|| 'batch'" to prevent undefined error
+    await ctx.reply('✅ Done!', getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0));
 });
 
 bot.action('admin_clear', async (ctx) => {
@@ -250,7 +243,7 @@ bot.action(/checksub_(.+)/, async (ctx) => {
 
 // --- ADMIN UPLOAD ---
 bot.on(['document', 'video', 'audio'], async (ctx) => {
-    if (!ctx.from) return; // Prevent crash on channel posts
+    if (!ctx.from) return; 
     if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
     try {
         const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
@@ -266,14 +259,15 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
 
         if (mode === 'single') {
             const safeName = escapeHTML(cleanCaption(rawCap));
-            await ctx.reply(`✅ <b>Saved!</b>\n\n<b>${safeName}</b>\n${link}`, { parse_mode: 'HTML', disable_web_page_preview: true, ...getFileControls(code) });
+            await ctx.reply(`<b>${safeName}</b>\n${link}`, { parse_mode: 'HTML', disable_web_page_preview: true, ...getFileControls(code) });
         } else {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
             global.batchStorage[ctx.from.id].push({ raw_caption: rawCap, link: link });
             await ctx.reply(`📥 Added (${global.batchStorage[ctx.from.id].length})`);
         }
     } catch (e) { 
-        throw new Error(`Upload Failed: ${e.message} (Check Channel ID)`);
+        // Log silently or simple reply
+        ctx.reply('❌ DB Channel Error.');
     }
 });
 
@@ -291,6 +285,7 @@ bot.start(async (ctx) => {
             else ctx.reply('❌ Invalid Link.');
         } else {
             if (ctx.from.id === ADMIN_ID) {
+                // FIX APPLIED HERE: Added "|| 'batch'"
                 const mode = global.userModes[ctx.from.id] || 'batch';
                 await ctx.reply(`⚙️ <b>Admin Panel</b>`, { parse_mode: 'HTML', ...getAdminKeyboard(mode, 0) });
             } else {
@@ -298,14 +293,8 @@ bot.start(async (ctx) => {
             }
         }
     } catch (e) {
-        throw new Error(`Start Error: ${e.message}`);
+        ctx.reply(`Start Error: ${e.message}`);
     }
-});
-
-// --- DEBUG COMMAND ---
-bot.command('debug', (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    ctx.reply(`🛠 <b>Debug Info:</b>\nAdmin ID: ${ADMIN_ID}\nChannel: ${CHANNEL_ID}\nForceSub: ${FORCE_SUB_IDS.length} channels`, { parse_mode: 'HTML' });
 });
 
 bot.on('text', async (ctx) => {
@@ -334,6 +323,6 @@ export default async function handler(req, res) {
         return res.status(200).send('Bot Active 🚀');
     } catch (e) {
         console.error(e);
-        return res.status(500).send('Error: ' + e.message);
+        return res.status(500).send('Error');
     }
 }
