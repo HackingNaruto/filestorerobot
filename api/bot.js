@@ -22,19 +22,13 @@ bot.catch((err, ctx) => {
 
 // --- HELPERS ---
 const encodePayload = (msgId) => {
-    // Using URL-Safe Base64 (Replace + with - and / with _)
     const text = `File_${msgId}_Secure`; 
-    return Buffer.from(text).toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=/g, ''); 
+    return Buffer.from(text).toString('base64').replace(/=/g, ''); 
 };
 
 const decodePayload = (code) => {
     try {
-        // Reverse URL-Safe Base64
-        let base64 = code.replace(/-/g, '+').replace(/_/g, '/');
-        const text = Buffer.from(base64, 'base64').toString('utf-8');
+        const text = Buffer.from(code, 'base64').toString('utf-8');
         const parts = text.split('_');
         if (parts[0] === 'File' && parts[2] === 'Secure') return parseInt(parts[1]);
         return null;
@@ -149,7 +143,6 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     if (shortLink) {
         const msgText = ctx.callbackQuery.message.text || "";
         const lines = msgText.split('\n');
-        // Filter out lines that look like links
         const captionLines = lines.filter(line => !line.includes('t.me/'));
         const caption = captionLines.join('\n').trim() || "File";
 
@@ -162,35 +155,50 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
-// --- UPDATED BATCH SHORTENER (FIXED REGEX) ---
+// --- UPDATED BATCH SHORTENER (Rebuild Method) ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing all links...');
+    await ctx.answerCbQuery('⏳ Processing...');
     
-    let originalText = ctx.callbackQuery.message.text;
+    const originalText = ctx.callbackQuery.message.text;
     if (!originalText) return;
 
-    // FIX: Regex now matches anything after start= until whitespace
-    // This catches underscores, hyphens, etc. which were missing before.
-    const urlRegex = /(https:\/\/t\.me\/[a-zA-Z0-9_]+\?start=[^\s\n]+)/g;
-    const matches = originalText.match(urlRegex);
+    // 1. Split message by double newline (File blocks)
+    const blocks = originalText.split('\n\n');
+    let newBlocks = [];
 
-    if (!matches) return ctx.answerCbQuery('⚠️ No links found.');
+    for (const block of blocks) {
+        // 2. Find any Telegram link in the block
+        const urlMatch = block.match(/(https:\/\/t\.me\/[^\s]+)/);
+        
+        if (urlMatch) {
+            const longUrl = urlMatch[0];
+            
+            // 3. Extract Caption (Remove URL from block)
+            let caption = block.replace(longUrl, '').trim();
+            
+            // 4. Shorten Link
+            const shortUrl = await getShortLink(longUrl);
 
-    let newText = originalText; 
-    
-    // Process matches
-    for (const longUrl of matches) {
-        const shortUrl = await getShortLink(longUrl);
-        if (shortUrl) {
-            newText = newText.replace(longUrl, shortUrl);
+            // 5. Rebuild Block with Bold Caption + Short Link
+            if (shortUrl) {
+                newBlocks.push(`<b>${escapeHTML(caption)}</b>\n${shortUrl}`);
+            } else {
+                // If fail, keep original
+                newBlocks.push(`<b>${escapeHTML(caption)}</b>\n${longUrl}`);
+            }
+        } else {
+            // No link found in this block, keep as is
+            if(block.trim()) newBlocks.push(block);
         }
     }
 
+    // 6. Send as NEW Message
+    const finalMessage = newBlocks.join('\n\n');
     try {
-        await ctx.reply(newText, { parse_mode: 'HTML', disable_web_page_preview: true });
+        await ctx.reply(finalMessage, { parse_mode: 'HTML', disable_web_page_preview: true });
     } catch (e) { 
         ctx.reply(`❌ Error sending new message: ${e.message}`); 
     }
