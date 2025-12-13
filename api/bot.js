@@ -135,7 +135,6 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     
     if (shortLink) {
         const msgText = ctx.callbackQuery.message.text || "";
-        // Remove existing link to get clean caption
         const caption = msgText.replace(/https:\/\/t\.me\/[^\s]+/, "").trim() || "File";
         await ctx.reply(`${caption}\n${shortLink}`, { disable_web_page_preview: true });
     } else {
@@ -143,45 +142,47 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
-// --- 🔥 BLOCK-BASED BATCH SHORTENER (PERFECT FORMAT) 🔥 ---
+// --- 🔥 SIMPLE LINE-BY-LINE SHORTENER 🔥 ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing...');
+    await ctx.answerCbQuery('⏳ Processing lines...');
     
     const text = ctx.callbackQuery.message.text;
     if (!text) return;
 
-    // 1. Split text into blocks (Files are separated by double newlines)
-    // Regex matches 2 or more newlines
-    const blocks = text.split(/\n\s*\n/);
-    
-    let newBlocks = [];
+    // 1. Split text into individual lines
+    const lines = text.split('\n');
+    let newLines = [];
 
-    for (const block of blocks) {
-        if (!block.trim()) continue; // Skip empty blocks
-
-        // 2. Find Telegram Link in this block
-        const urlMatch = block.match(/(https:\/\/t\.me\/[^\s]+)/);
-        
-        if (urlMatch) {
-            const longUrl = urlMatch[0];
-            const shortUrl = await getShortLink(longUrl);
-            
-            // 3. Replace ONLY the link inside this block
-            if (shortUrl) {
-                newBlocks.push(block.replace(longUrl, shortUrl));
+    // 2. Loop through every line
+    for (let line of lines) {
+        // 3. Check if line contains a Telegram Link
+        if (line.includes('https://t.me/')) {
+            // Extract the URL (removes any accidental spaces)
+            const match = line.match(/(https:\/\/t\.me\/[^\s]+)/);
+            if (match) {
+                const longUrl = match[0];
+                const shortUrl = await getShortLink(longUrl);
+                
+                // If shortened success, use Short Link. Else keep Original.
+                if (shortUrl) {
+                    newLines.push(shortUrl);
+                } else {
+                    newLines.push(line);
+                }
             } else {
-                newBlocks.push(block); // Keep original if shorten fails
+                newLines.push(line);
             }
         } else {
-            // No link in this block (Header or footer), keep as is
-            newBlocks.push(block);
+            // 4. If it's a Caption or Empty line, keep it exactly as is
+            newLines.push(line);
         }
     }
 
-    const finalMessage = newBlocks.join('\n\n');
+    // 5. Rejoin lines and send
+    const finalMessage = newLines.join('\n');
 
     try {
         await ctx.reply(finalMessage, { disable_web_page_preview: true });
@@ -217,7 +218,6 @@ bot.action('admin_process', async (ctx) => {
         let txt = "";
         groups[k].forEach(f => {
             const safeName = cleanCaption(f.raw_caption);
-            // Plain text output with double newline separation
             txt += `${safeName}\n${f.link}\n\n`;
         });
         try { await ctx.reply(txt, { disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
