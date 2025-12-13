@@ -155,48 +155,54 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
-// --- UPDATED BATCH SHORTENER (Rebuild Method) ---
+// --- 🔥 FIXED BATCH SHORTENER LOGIC (SCANNER METHOD) 🔥 ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Processing...');
+    await ctx.answerCbQuery('⏳ Processing (This may take a moment)...');
     
     const originalText = ctx.callbackQuery.message.text;
     if (!originalText) return;
 
-    // 1. Split message by double newline (File blocks)
-    const blocks = originalText.split('\n\n');
+    // 1. Find all links and their positions
+    // This Regex finds all Telegram Bot Links
+    const urlRegex = /(https:\/\/t\.me\/[^\s]+)/g;
+    let match;
+    let lastIndex = 0;
     let newBlocks = [];
 
-    for (const block of blocks) {
-        // 2. Find any Telegram link in the block
-        const urlMatch = block.match(/(https:\/\/t\.me\/[^\s]+)/);
-        
-        if (urlMatch) {
-            const longUrl = urlMatch[0];
-            
-            // 3. Extract Caption (Remove URL from block)
-            let caption = block.replace(longUrl, '').trim();
-            
-            // 4. Shorten Link
-            const shortUrl = await getShortLink(longUrl);
+    // Loop through every link found
+    while ((match = urlRegex.exec(originalText)) !== null) {
+        const longLink = match[0];
+        const linkStartIndex = match.index;
 
-            // 5. Rebuild Block with Bold Caption + Short Link
-            if (shortUrl) {
-                newBlocks.push(`<b>${escapeHTML(caption)}</b>\n${shortUrl}`);
-            } else {
-                // If fail, keep original
-                newBlocks.push(`<b>${escapeHTML(caption)}</b>\n${longUrl}`);
-            }
+        // 2. Get the Caption (Text BEFORE this link, up to the previous link)
+        let captionRaw = originalText.substring(lastIndex, linkStartIndex).trim();
+        
+        // Clean up the caption (remove Short: tags if re-running)
+        captionRaw = captionRaw.replace('✂️', '').replace('Short:', '').trim();
+
+        // 3. Shorten the link
+        const shortLink = await getShortLink(longLink);
+        
+        // 4. Format: Bold Caption + Short Link (or original if failed)
+        if (shortLink) {
+            newBlocks.push(`<b>${escapeHTML(captionRaw)}</b>\n${shortLink}`);
         } else {
-            // No link found in this block, keep as is
-            if(block.trim()) newBlocks.push(block);
+            newBlocks.push(`<b>${escapeHTML(captionRaw)}</b>\n${longLink}`);
         }
+
+        // Update index for next loop
+        lastIndex = linkStartIndex + longLink.length;
     }
 
-    // 6. Send as NEW Message
+    // If no links found, exit
+    if (newBlocks.length === 0) return ctx.answerCbQuery('⚠️ No links found.');
+
+    // 5. Send as NEW Message
     const finalMessage = newBlocks.join('\n\n');
+    
     try {
         await ctx.reply(finalMessage, { parse_mode: 'HTML', disable_web_page_preview: true });
     } catch (e) { 
