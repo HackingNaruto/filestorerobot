@@ -1,6 +1,4 @@
 const { Telegraf, Markup } = require('telegraf');
-const FormData = require('form-data');
-const axios = require('axios');
 
 // --- CONFIGURATION ---
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -8,7 +6,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
-// --- MEMORY STORAGE (Global Vars for Vercel) ---
+// --- MEMORY STORAGE ---
 global.batchStorage = global.batchStorage || {}; 
 global.shortenerConfig = global.shortenerConfig || {
     domain: process.env.SHORTENER_DOMAIN || "", 
@@ -16,12 +14,10 @@ global.shortenerConfig = global.shortenerConfig || {
 };
 global.telegraphToken = global.telegraphToken || ""; 
 
-// --- ERROR HANDLING (Prevents Crash) ---
+// --- ERROR HANDLING ---
 bot.catch((err, ctx) => {
     console.error(`Bot Error:`, err);
-    try {
-        ctx.reply(`⚠️ <b>Error Occurred:</b>\n<code>${err.message}</code>`, { parse_mode: 'HTML' });
-    } catch(e) {}
+    try { ctx.reply(`⚠️ Error: ${err.message}`); } catch(e) {}
 });
 
 // --- HELPERS ---
@@ -49,59 +45,54 @@ const cleanCaption = (text) => {
     return clean.trim();
 };
 
-// --- API FUNCTIONS ---
+// --- API FUNCTIONS (NATIVE FETCH - NO AXIOS) ---
 
-// 1. URL Shortener (Axios)
+// 1. URL Shortener
 const getShortLink = async (longUrl) => {
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return null;
     try {
         const apiUrl = `https://${global.shortenerConfig.domain}/api?api=${global.shortenerConfig.key}&url=${encodeURIComponent(longUrl)}`;
-        const response = await axios.get(apiUrl);
-        if (response.data.status === 'success' || response.data.shortenedUrl) return response.data.shortenedUrl;
+        const response = await fetch(apiUrl);
+        const data = await response.json();
+        if (data.status === 'success' || data.shortenedUrl) return data.shortenedUrl;
         return null;
-    } catch (error) { 
-        console.error("Shortener Error:", error.message);
-        return null; 
-    }
+    } catch (error) { return null; }
 };
 
-// 2. Upload to Catbox (Robust Axios Method)
+// 2. Upload to Catbox (Using Native FormData)
 const uploadToCatbox = async (fileUrl) => {
     try {
-        // Step A: Download Image
-        const imageRes = await axios.get(fileUrl, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(imageRes.data);
+        // Download Image
+        const fileRes = await fetch(fileUrl);
+        const blob = await fileRes.blob();
 
-        // Step B: Prepare Form
-        const form = new FormData();
-        form.append('reqtype', 'fileupload');
-        form.append('fileToUpload', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' });
+        // Create FormData
+        const formData = new FormData();
+        formData.append('reqtype', 'fileupload');
+        formData.append('fileToUpload', blob, 'image.jpg');
 
-        // Step C: Upload with Correct Headers
-        const response = await axios.post('https://catbox.moe/user/api.php', form, {
-            headers: {
-                ...form.getHeaders(),
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            }
+        // Upload
+        const response = await fetch('https://catbox.moe/user/api.php', {
+            method: 'POST',
+            body: formData
         });
-
-        if (response.data && response.data.toString().startsWith('http')) {
-            return response.data.trim();
-        }
+        
+        const text = await response.text();
+        if (text.startsWith('http')) return text.trim();
         return null;
     } catch (e) {
-        console.error("Catbox Error:", e.message);
-        throw new Error("Catbox Upload Failed: " + e.message);
+        console.error("Catbox Error:", e);
+        return null;
     }
 };
 
 // 3. Create Telegraph Page
 const createTelegraphPage = async (title, nodes) => {
     try {
-        // Create Account if missing
         if (!global.telegraphToken) {
-            const accRes = await axios.get(`https://api.telegra.ph/createAccount?short_name=FileBot&author_name=Admin`);
-            if (accRes.data.ok) global.telegraphToken = accRes.data.result.access_token;
+            const accRes = await fetch(`https://api.telegra.ph/createAccount?short_name=FileBot&author_name=Admin`);
+            const accData = await accRes.json();
+            if (accData.ok) global.telegraphToken = accData.result.access_token;
         }
 
         const contentStr = JSON.stringify(nodes);
@@ -111,12 +102,16 @@ const createTelegraphPage = async (title, nodes) => {
         params.append('content', contentStr);
         params.append('return_content', 'true');
 
-        const response = await axios.post('https://api.telegra.ph/createPage', params);
+        const response = await fetch('https://api.telegra.ph/createPage', {
+            method: 'POST',
+            body: params
+        });
         
-        if (response.data.ok) return response.data.result.url;
+        const data = await response.json();
+        if (data.ok) return data.result.url;
         return null;
     } catch (e) {
-        console.error("Telegraph Error:", e.message);
+        console.error("Telegraph Error:", e);
         return null;
     }
 };
@@ -144,7 +139,6 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 CREATE GRAPH PAGE 🔥 ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -153,99 +147,69 @@ bot.action('batch_create_graph', async (ctx) => {
         return ctx.reply('⚠️ Queue empty. Send files and an image.');
     }
 
-    await ctx.reply("⏳ Processing... Creating Page (Please Wait)...");
+    await ctx.reply("⏳ Creating Page...");
 
     let domNodes = [];
 
-    // --- POSTER ---
+    // Poster
     if (userData.poster) {
-        domNodes.push({
-            tag: 'img',
-            attrs: { src: userData.poster }
-        });
+        domNodes.push({ tag: 'img', attrs: { src: userData.poster } });
         domNodes.push({ tag: 'br' });
     }
 
-    // --- HEADER ---
+    // Header
     domNodes.push({ tag: 'h4', children: ['🔻 DOWNLOAD LINKS 🔻'] });
     domNodes.push({ tag: 'hr' });
 
-    // --- FILES ---
+    // Files
     for (const file of userData.files) {
-        // Shorten Link
-        let linkToUse = file.longLink;
-        const shortLink = await getShortLink(file.longLink);
-        if (shortLink) linkToUse = shortLink;
+        const shortLink = await getShortLink(file.longLink) || file.longLink;
         
-        // Movie Title (Bold)
-        domNodes.push({ 
-            tag: 'b', 
-            children: [`📂 ${file.caption}`] 
-        });
+        domNodes.push({ tag: 'b', children: [`📂 ${file.caption}`] });
         domNodes.push({ tag: 'br' });
-
-        // Download Button/Link
-        domNodes.push({ 
-            tag: 'a', 
-            attrs: { href: linkToUse }, 
-            children: ['📥 ᴄʟɪᴄᴋ ᴛᴏ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ'] 
-        });
-
+        domNodes.push({ tag: 'a', attrs: { href: shortLink }, children: ['📥 ᴄʟɪᴄᴋ ᴛᴏ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ'] });
         domNodes.push({ tag: 'br' });
         domNodes.push({ tag: 'br' });
     }
 
-    // --- FOOTER ---
+    // Footer
     domNodes.push({ tag: 'hr' });
     domNodes.push({ tag: 'i', children: ['Join our Telegram Channel'] });
 
     const pageTitle = userData.files[0] ? userData.files[0].caption.split(' - ')[0] : "Movie Collection";
-    
     const graphUrl = await createTelegraphPage(pageTitle, domNodes);
 
     if (graphUrl) {
         await ctx.reply(`✅ **Graph Page Ready!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
         delete global.batchStorage[ctx.from.id];
     } else {
-        await ctx.reply("❌ Failed to create Graph page. Check logs.");
+        await ctx.reply("❌ Failed to create Graph page.");
     }
 });
 
-
 // --- UPLOAD HANDLERS ---
 
-// 1. Handle POSTER
 bot.on('photo', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
-
     await ctx.reply("🖼 Uploading to Catbox...");
-
     try {
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         const fileLink = await ctx.telegram.getFileLink(photo.file_id);
-        
-        // Upload (If this fails, bot.catch will catch it)
         const catboxUrl = await uploadToCatbox(fileLink.href);
 
         if (catboxUrl) {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
             global.batchStorage[ctx.from.id].poster = catboxUrl;
-            
             await ctx.reply(`✅ **Poster Set!**\nNow send files.`, getAdminKeyboard());
         } else {
-            await ctx.reply("❌ Catbox Upload Failed.");
+            await ctx.reply("❌ Upload Failed.");
         }
-    } catch (e) {
-        // Error is handled by bot.catch, but reply here for user awareness
-        ctx.reply(`❌ Error: ${e.message}`);
-    }
+    } catch (e) { ctx.reply(`❌ Error: ${e.message}`); }
 });
 
-// 2. Handle FILES
 bot.on(['document', 'video', 'audio'], async (ctx) => {
     if (!ctx.from) return; 
     if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
-    
     try {
         const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
         const code = encodePayload(sent.message_id);
@@ -259,17 +223,11 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
         const safeName = cleanCaption(rawCap);
 
         if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
-        
-        global.batchStorage[ctx.from.id].files.push({
-            caption: safeName,
-            longLink: longLink
-        });
+        global.batchStorage[ctx.from.id].files.push({ caption: safeName, longLink: longLink });
 
-        const count = global.batchStorage[ctx.from.id].files.length;
-        if (count === 1) {
+        if (global.batchStorage[ctx.from.id].files.length === 1) {
             await ctx.reply(`📥 **Batch Started.**\n\nSend Image -> Send Files -> Click 'Create Graph'`, getAdminKeyboard());
         }
-
     } catch (e) { ctx.reply('❌ DB Channel Error.'); }
 });
 
@@ -331,13 +289,11 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// Vercel Handler (Standard)
 export default async function handler(req, res) {
     try {
         if (req.method === 'POST') {
             if(!bot.botInfo) bot.botInfo = await bot.telegram.getMe();
             await bot.handleUpdate(req.body);
-            // Respond 200 OK immediately to prevent Telegram retries
             return res.status(200).send('OK');
         }
         return res.status(200).send('Bot Active 🚀');
