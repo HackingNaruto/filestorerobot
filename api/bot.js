@@ -22,13 +22,19 @@ bot.catch((err, ctx) => {
 
 // --- HELPERS ---
 const encodePayload = (msgId) => {
+    // Using URL-Safe Base64 (Replace + with - and / with _)
     const text = `File_${msgId}_Secure`; 
-    return Buffer.from(text).toString('base64').replace(/=/g, ''); 
+    return Buffer.from(text).toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=/g, ''); 
 };
 
 const decodePayload = (code) => {
     try {
-        const text = Buffer.from(code, 'base64').toString('utf-8');
+        // Reverse URL-Safe Base64
+        let base64 = code.replace(/-/g, '+').replace(/_/g, '/');
+        const text = Buffer.from(base64, 'base64').toString('utf-8');
         const parts = text.split('_');
         if (parts[0] === 'File' && parts[2] === 'Secure') return parseInt(parts[1]);
         return null;
@@ -130,7 +136,6 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ <b>Shortener Config</b>\nStatus: ${current}\n\nSend: <code>domain.com | api_key</code>`, { parse_mode: 'HTML' });
 });
 
-// --- SINGLE FILE SHORTENER FIX ---
 bot.action(/shorten_(.+)/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     const code = ctx.match[1];
@@ -142,12 +147,9 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     const shortLink = await getShortLink(longLink);
     
     if (shortLink) {
-        // FIX: Get Caption from Message TEXT (because bot reply is text, not caption)
         const msgText = ctx.callbackQuery.message.text || "";
-        // Remove the old link from text to get just the caption
-        // Assuming format is: "Caption \n https://t.me/..."
         const lines = msgText.split('\n');
-        // Filter out the line containing the telegram link
+        // Filter out lines that look like links
         const captionLines = lines.filter(line => !line.includes('t.me/'));
         const caption = captionLines.join('\n').trim() || "File";
 
@@ -160,22 +162,26 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     }
 });
 
-// --- BATCH SHORTENER FIX ---
+// --- UPDATED BATCH SHORTENER (FIXED REGEX) ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
 
-    await ctx.answerCbQuery('⏳ Generating new message...');
+    await ctx.answerCbQuery('⏳ Processing all links...');
     
     let originalText = ctx.callbackQuery.message.text;
     if (!originalText) return;
 
-    const urlRegex = /(https:\/\/t\.me\/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9]+)/g;
+    // FIX: Regex now matches anything after start= until whitespace
+    // This catches underscores, hyphens, etc. which were missing before.
+    const urlRegex = /(https:\/\/t\.me\/[a-zA-Z0-9_]+\?start=[^\s\n]+)/g;
     const matches = originalText.match(urlRegex);
 
     if (!matches) return ctx.answerCbQuery('⚠️ No links found.');
 
     let newText = originalText; 
+    
+    // Process matches
     for (const longUrl of matches) {
         const shortUrl = await getShortLink(longUrl);
         if (shortUrl) {
