@@ -38,14 +38,10 @@ const decodePayload = (code) => {
 
 const cleanCaption = (text) => {
     if (!text) return "Untitled File";
-    // Remove specific unwanted lines
     let clean = String(text)
         .replace(/⭕️ Main Channel : @StarFlixTamil ⭕️/g, "")
-        .replace(/(Main Channel|Join Channel).*/gi, "");
-    
-    // Remove standalone @usernames
-    clean = clean.replace(/@[\w_]+/g, "");
-    
+        .replace(/(Main Channel|Join Channel).*/gi, "")
+        .replace(/@[\w_]+/g, "");
     return clean.trim();
 };
 
@@ -139,17 +135,15 @@ bot.action(/shorten_(.+)/, async (ctx) => {
     
     if (shortLink) {
         const msgText = ctx.callbackQuery.message.text || "";
-        // Extract caption by removing the link line
+        // Remove existing link to get clean caption
         const caption = msgText.replace(/https:\/\/t\.me\/[^\s]+/, "").trim() || "File";
-        
-        // NO HTML, JUST PLAIN TEXT
         await ctx.reply(`${caption}\n${shortLink}`, { disable_web_page_preview: true });
     } else {
         await ctx.answerCbQuery('❌ API Error.', { show_alert: true });
     }
 });
 
-// --- 🔥 FINAL ROBUST BATCH SHORTENER 🔥 ---
+// --- 🔥 BLOCK-BASED BATCH SHORTENER (PERFECT FORMAT) 🔥 ---
 bot.action('batch_shorten_all', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
@@ -159,39 +153,37 @@ bot.action('batch_shorten_all', async (ctx) => {
     const text = ctx.callbackQuery.message.text;
     if (!text) return;
 
-    // 1. Find all Telegram Links
-    const matches = [...text.matchAll(/https:\/\/t\.me\/[^\s]+/g)];
-    if (matches.length === 0) return ctx.answerCbQuery('No links found');
+    // 1. Split text into blocks (Files are separated by double newlines)
+    // Regex matches 2 or more newlines
+    const blocks = text.split(/\n\s*\n/);
+    
+    let newBlocks = [];
 
-    let finalMessage = "";
-    let lastIndex = 0;
+    for (const block of blocks) {
+        if (!block.trim()) continue; // Skip empty blocks
 
-    for (const match of matches) {
-        const url = match[0];
-        const startIndex = match.index;
-
-        // 2. Get text BEFORE the link (This is the Caption)
-        // We trim it to remove extra newlines
-        let caption = text.substring(lastIndex, startIndex).trim();
-
-        // 3. Shorten
-        const short = await getShortLink(url);
-        const linkToShow = short || url; // Fallback to original if fail
-
-        // 4. Build Output (Plain Text)
-        // If caption exists, print it. If empty (rare), just print link.
-        if (caption) {
-            finalMessage += `${caption}\n${linkToShow}\n\n`;
+        // 2. Find Telegram Link in this block
+        const urlMatch = block.match(/(https:\/\/t\.me\/[^\s]+)/);
+        
+        if (urlMatch) {
+            const longUrl = urlMatch[0];
+            const shortUrl = await getShortLink(longUrl);
+            
+            // 3. Replace ONLY the link inside this block
+            if (shortUrl) {
+                newBlocks.push(block.replace(longUrl, shortUrl));
+            } else {
+                newBlocks.push(block); // Keep original if shorten fails
+            }
         } else {
-            finalMessage += `${linkToShow}\n\n`;
+            // No link in this block (Header or footer), keep as is
+            newBlocks.push(block);
         }
-
-        // Move cursor forward
-        lastIndex = startIndex + url.length;
     }
 
+    const finalMessage = newBlocks.join('\n\n');
+
     try {
-        // Send as Plain Text (No Parse Mode = No Errors)
         await ctx.reply(finalMessage, { disable_web_page_preview: true });
     } catch (e) { 
         ctx.reply(`Error: ${e.message}`); 
@@ -225,11 +217,11 @@ bot.action('admin_process', async (ctx) => {
         let txt = "";
         groups[k].forEach(f => {
             const safeName = cleanCaption(f.raw_caption);
+            // Plain text output with double newline separation
             txt += `${safeName}\n${f.link}\n\n`;
         });
-        // Plain text output for initial list too
         try { await ctx.reply(txt, { disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
-            ctx.reply(`Error sending group: ${e.message}`);
+            ctx.reply(`Error: ${e.message}`);
         }
     }
     delete global.batchStorage[ctx.from.id];
@@ -272,7 +264,6 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
 
         if (mode === 'single') {
             const safeName = cleanCaption(rawCap);
-            // Plain text
             await ctx.reply(`${safeName}\n${link}`, { disable_web_page_preview: true, ...getFileControls(code) });
         } else {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
