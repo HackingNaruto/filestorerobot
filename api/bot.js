@@ -7,7 +7,7 @@ const ADMIN_ID = Number(process.env.ADMIN_ID);
 const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
 // --- MEMORY STORAGE ---
-// Global variables for Serverless environment
+global.batchStorage = global.batchStorage || {}; // Stores files temporarily
 global.shortenerConfig = global.shortenerConfig || {
     domain: process.env.SHORTENER_DOMAIN || "", 
     key: process.env.SHORTENER_KEY || ""
@@ -21,7 +21,6 @@ bot.catch((err, ctx) => {
 
 // --- HELPERS ---
 const encodePayload = (msgId) => {
-    // URL-Safe Base64 encoding
     const text = `File_${msgId}_Secure`; 
     return Buffer.from(text).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_'); 
 };
@@ -61,7 +60,9 @@ const getShortLink = async (longUrl) => {
 // --- KEYBOARDS ---
 const getAdminKeyboard = () => {
     return Markup.inlineKeyboard([
-        [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')]
+        [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')],
+        [Markup.button.callback(`📤 Process Batch Now`, 'batch_process')],
+        [Markup.button.callback(`❌ Clear Queue`, 'batch_clear')]
     ]);
 };
 
@@ -100,6 +101,62 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Shortener Config\nStatus: ${current}\n\nSend: domain.com | api_key`);
 });
 
+bot.action('batch_clear', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    delete global.batchStorage[ctx.from.id];
+    await ctx.reply("🗑 Queue Cleared!");
+});
+
+// --- 🔥 BATCH PROCESSOR (The Fix for 7 Messages) 🔥 ---
+bot.action('batch_process', async (ctx) => {
+    await processBatch(ctx);
+});
+bot.command('batch', async (ctx) => {
+    await processBatch(ctx);
+});
+
+async function processBatch(ctx) {
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
+    
+    const files = global.batchStorage[ctx.from.id];
+    if (!files || files.length === 0) return ctx.reply('⚠️ Queue is empty! Send files first.');
+
+    await ctx.reply(`⏳ Processing ${files.length} files...`);
+
+    let finalMessage = "";
+
+    // Loop through all stored files
+    for (const file of files) {
+        let shortLink = null;
+        
+        // Try to shorten
+        if (global.shortenerConfig.domain && global.shortenerConfig.key) {
+            shortLink = await getShortLink(file.longLink);
+        }
+
+        // FORMAT: 
+        // Caption
+        // Original Link
+        // Short Link
+        finalMessage += `${file.caption}\nOriginal: ${file.longLink}\n`;
+        
+        if (shortLink) {
+            finalMessage += `Short: ${shortLink}\n\n`;
+        } else {
+            finalMessage += `(Shortener Failed)\n\n`;
+        }
+    }
+
+    // Send the Big Message
+    try {
+        await ctx.reply(finalMessage, { disable_web_page_preview: true });
+        // Clear queue after success
+        delete global.batchStorage[ctx.from.id];
+    } catch (e) {
+        ctx.reply(`❌ Error sending message (Too long?): ${e.message}`);
+    }
+}
+
 bot.action(/checksub_(.+)/, async (ctx) => {
     const pl = ctx.match[1];
     if (await checkForceSub(ctx, ctx.from.id)) {
@@ -111,8 +168,7 @@ bot.action(/checksub_(.+)/, async (ctx) => {
     } else await ctx.answerCbQuery('⚠️ Join first!', { show_alert: true });
 });
 
-// --- ADMIN UPLOAD (DIRECT SHORTENER) ---
-// Inga thaan change pannirukken. Upload panna udane Short Link varum.
+// --- ADMIN UPLOAD (COLLECT FILES) ---
 bot.on(['document', 'video', 'audio'], async (ctx) => {
     if (!ctx.from) return; 
     if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
@@ -133,15 +189,20 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
         if (!rawCap) rawCap = "Untitled File";
         const safeName = cleanCaption(rawCap);
 
-        // 4. Try to Shorten
-        let finalLink = longLink;
-        if (global.shortenerConfig.domain && global.shortenerConfig.key) {
-            const shortUrl = await getShortLink(longLink);
-            if (shortUrl) finalLink = shortUrl;
-        }
+        // 4. ADD TO QUEUE (Don't reply yet!)
+        if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
+        
+        global.batchStorage[ctx.from.id].push({
+            caption: safeName,
+            longLink: longLink
+        });
 
-        // 5. Send Output Immediately (No Batch Waiting)
-        await ctx.reply(`${safeName}\n${finalLink}`, { disable_web_page_preview: true });
+        // 5. Silent Confirmation (Optional: Delete to keep chat clean, or just ignore)
+        // Just sending a "dot" or updating a counter could be better, but for now:
+        const count = global.batchStorage[ctx.from.id].length;
+        if (count === 1) {
+            await ctx.reply(`📥 Started Batch. Send more files.\nWhen finished, click 'Process Batch' or type /batch`, getAdminKeyboard());
+        }
 
     } catch (e) { 
         console.error(e);
@@ -149,25 +210,33 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
     }
 });
 
-// --- START & TEXT ---
+// --- START COMMAND (FIXED) ---
 bot.start(async (ctx) => {
     try {
+        // 1. Check Payload (User asking for file)
         const pl = ctx.payload;
-        if (!await checkForceSub(ctx, ctx.from.id)) {
-            return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
-        }
-        
         if (pl) {
+            if (!await checkForceSub(ctx, ctx.from.id)) {
+                return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
+            }
             const id = decodePayload(pl);
             if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File missing.'); }
             else ctx.reply('❌ Invalid Link.');
-        } else {
-            if (ctx.from.id === ADMIN_ID) {
-                await ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard());
-            } else {
-                ctx.reply('🤖 Send me a link.');
-            }
+            return;
         }
+
+        // 2. No Payload - Check if Admin
+        if (ctx.from.id === ADMIN_ID) {
+            const count = global.batchStorage[ctx.from.id] ? global.batchStorage[ctx.from.id].length : 0;
+            await ctx.reply(`👋 <b>Hello Admin!</b>\n\nFiles in Queue: ${count}\n\nSend files to start batching.`, { parse_mode: 'HTML', ...getAdminKeyboard() });
+        } else {
+            // 3. Normal User
+            if (!await checkForceSub(ctx, ctx.from.id)) {
+                return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, '') });
+            }
+            ctx.reply('🤖 Send me a link to get files.');
+        }
+
     } catch (e) {
         ctx.reply(`Start Error: ${e.message}`);
     }
@@ -175,6 +244,7 @@ bot.start(async (ctx) => {
 
 bot.on('text', async (ctx) => {
     if (!ctx.from) return;
+    // Shortener Config Logic
     if (ctx.from.id === ADMIN_ID && global.awaitingShortenerConfig[ctx.from.id]) {
         const text = ctx.message.text;
         if (text.includes('|')) {
