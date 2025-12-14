@@ -45,15 +45,13 @@ const cleanCaption = (text) => {
     return clean.trim();
 };
 
-// Extracts "Movie Name (Year)" from a long string
 const extractTitle = (text) => {
-    // Regex to find "Name (Year)"
     const match = text.match(/^(.+?\(\d{4}\))/);
-    if (match) return match[1].trim(); // Return "Name (2024)"
-    return text.split('-')[0].trim(); // Fallback: Take text before first hyphen
+    if (match) return match[1].trim(); 
+    return text.split('-')[0].trim(); 
 };
 
-// --- API FUNCTIONS (NATIVE FETCH) ---
+// --- API FUNCTIONS ---
 
 // 1. URL Shortener
 const getShortLink = async (longUrl) => {
@@ -84,26 +82,26 @@ const uploadToCatbox = async (fileUrl) => {
         const text = await response.text();
         if (text.startsWith('http')) return text.trim();
         return null;
-    } catch (e) {
-        console.error("Catbox Error:", e);
-        return null;
-    }
+    } catch (e) { return null; }
 };
 
-// 3. Create Telegraph Page (Graph.org)
+// 3. Create Telegraph Page (Fixes: Author, Caption, Bold)
 const createTelegraphPage = async (title, nodes) => {
     try {
+        // Step A: Ensure Account Exists
         if (!global.telegraphToken) {
-            // AUTHOR NAME SET HERE: @StarFlixTamil
             const accRes = await fetch(`https://api.telegra.ph/createAccount?short_name=StarFlix&author_name=@StarFlixTamil`);
             const accData = await accRes.json();
             if (accData.ok) global.telegraphToken = accData.result.access_token;
         }
 
+        // Step B: Create Page with Explicit Author Name
         const contentStr = JSON.stringify(nodes);
         const params = new URLSearchParams();
         params.append('access_token', global.telegraphToken);
         params.append('title', title);
+        params.append('author_name', '@StarFlixTamil'); // Explicit Author Name
+        params.append('author_url', 'https://t.me/StarFlixTamil'); // Optional URL
         params.append('content', contentStr);
         params.append('return_content', 'true');
 
@@ -113,7 +111,7 @@ const createTelegraphPage = async (title, nodes) => {
         });
         
         const data = await response.json();
-        if (data.ok) return data.result.url; // Returns telegra.ph link initially
+        if (data.ok) return data.result.url;
         return null;
     } catch (e) {
         console.error("Telegraph Error:", e);
@@ -144,7 +142,7 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 CREATE GRAPH PAGE (DESIGN MATCHING SCREENSHOT) 🔥 ---
+// --- 🔥 CREATE GRAPH PAGE (DESIGN FIXED) 🔥 ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -153,59 +151,60 @@ bot.action('batch_create_graph', async (ctx) => {
         return ctx.reply('⚠️ Queue empty. Send files and an image.');
     }
 
-    await ctx.reply("⏳ Creating Page (Graph.org)...");
+    await ctx.reply("⏳ Creating Page...");
 
     let domNodes = [];
 
-    // 1. Title Extraction "Movie (Year)"
+    // 1. Title Extraction
     const firstFileCaption = userData.files[0] ? userData.files[0].caption : "Movie Collection";
     const cleanTitle = extractTitle(firstFileCaption);
 
-    // 2. Poster Image
+    // 2. Poster Image with Caption (Using 'figure' for proper caption)
     if (userData.poster) {
-        domNodes.push({ tag: 'img', attrs: { src: userData.poster } });
-        // Caption under image (Movie Name Year)
-        domNodes.push({ tag: 'figcaption', children: [cleanTitle] });
+        domNodes.push({
+            tag: 'figure',
+            children: [
+                { tag: 'img', attrs: { src: userData.poster } },
+                { tag: 'figcaption', children: [cleanTitle] } // Caption matches Title
+            ]
+        });
     }
 
-    // 3. "Telegram Files" Header
-    domNodes.push({ tag: 'p', children: ['Telegram Files'] });
-    domNodes.push({ tag: 'br' });
+    // 3. "Telegram Files" Header (Bold, No extra spacing)
+    domNodes.push({ 
+        tag: 'p', 
+        children: [{ tag: 'b', children: ['Telegram Files'] }] 
+    });
 
     // 4. File List
     for (const file of userData.files) {
         const shortLink = await getShortLink(file.longLink) || file.longLink;
         
-        // File Name
-        domNodes.push({ tag: 'p', children: [file.caption] });
-        
-        // Link
+        // File Name (Bold)
         domNodes.push({ 
-            tag: 'a', 
-            attrs: { href: shortLink }, 
-            children: [shortLink] // Display the link text itself as per screenshot
+            tag: 'p', 
+            children: [{ tag: 'b', children: [file.caption] }] 
         });
-
-        // Space between items
-        domNodes.push({ tag: 'br' });
+        
+        // Link (Normal)
+        domNodes.push({ 
+            tag: 'p', 
+            children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] 
+        });
     }
 
-    // 5. Footer: "⭕️ Main Channel : @StarFlixTamil ⭕️"
+    // 5. Footer (Bold)
     domNodes.push({ tag: 'br' });
     domNodes.push({ 
         tag: 'p', 
-        children: [
-            { tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }
-        ] 
+        children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
     });
 
     // Create Page
     let graphUrl = await createTelegraphPage(cleanTitle, domNodes);
 
     if (graphUrl) {
-        // Convert 'telegra.ph' to 'graph.org'
         graphUrl = graphUrl.replace('telegra.ph', 'graph.org');
-        
         await ctx.reply(`✅ **Graph Page Ready!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
         delete global.batchStorage[ctx.from.id];
     } else {
