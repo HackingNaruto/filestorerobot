@@ -51,7 +51,7 @@ const extractTitle = (text) => {
     return text.split('-')[0].trim(); 
 };
 
-// --- API FUNCTIONS (Native Fetch) ---
+// --- API FUNCTIONS ---
 
 // 1. URL Shortener
 const getShortLink = async (longUrl) => {
@@ -85,7 +85,7 @@ const uploadToCatbox = async (fileUrl) => {
     } catch (e) { return null; }
 };
 
-// 3. Create Telegraph Page (Perfect Layout)
+// 3. Create Telegraph Page
 const createTelegraphPage = async (title, nodes) => {
     try {
         if (!global.telegraphToken) {
@@ -140,7 +140,7 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 CREATE GRAPH PAGE (FIXED SPACING & LAYOUT) 🔥 ---
+// --- 🔥 CREATE GRAPH PAGE (FULL BOLD) 🔥 ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -157,7 +157,7 @@ bot.action('batch_create_graph', async (ctx) => {
     const firstFileCaption = userData.files[0] ? userData.files[0].caption : "Movie Collection";
     const cleanTitle = extractTitle(firstFileCaption);
 
-    // 2. Poster Image with Caption
+    // 2. Poster Image
     if (userData.poster) {
         domNodes.push({
             tag: 'figure',
@@ -168,37 +168,37 @@ bot.action('batch_create_graph', async (ctx) => {
         });
     }
 
-    // 3. "Telegram Files" Header (Plain text as per screenshot)
-    // Screenshot 1-il "Telegram Files" normal text-aaga irukku.
+    // 3. Header: "Telegram Files" (BOLD)
     domNodes.push({ 
         tag: 'p', 
-        children: ['Telegram Files'] 
+        children: [{ tag: 'b', children: ['Telegram Files'] }] 
     });
 
-    // 4. File List (Exact Spacing Match)
+    // 4. Files List (ALL BOLD)
     for (const file of userData.files) {
         const shortLink = await getShortLink(file.longLink) || file.longLink;
         
-        // File Name (Paragraph - Bold)
+        // Use 'strong' tag for robust bolding
         domNodes.push({
             tag: 'p',
-            children: [{ tag: 'b', children: [file.caption] }]
-        });
-        
-        // Link (Paragraph - Normal Text - Visible URL)
-        // Note: No 'br' tags pushed separately. Paragraphs create natural spacing.
-        domNodes.push({ 
-            tag: 'p', 
-            children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] 
+            children: [
+                // File Name (Bold)
+                { tag: 'strong', children: [file.caption] },
+                { tag: 'br' },
+                // Link (Bold + Clickable)
+                { 
+                    tag: 'strong', 
+                    children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] 
+                }
+            ]
         });
     }
 
-    // 5. Footer (Bold + Red Circles)
-    // Adding one break to separate from list
+    // 5. Footer (BOLD)
     domNodes.push({ tag: 'br' });
     domNodes.push({ 
         tag: 'p', 
-        children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
+        children: [{ tag: 'strong', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
     });
 
     // Create Page
@@ -252,7 +252,6 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
         global.batchStorage[ctx.from.id].files.push({ caption: safeName, longLink: longLink });
 
         const count = global.batchStorage[ctx.from.id].files.length;
-        // Instant Reply with Count
         await ctx.reply(`📂 Added (${count})`);
 
         if (count === 1) {
