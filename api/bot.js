@@ -140,7 +140,7 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 CREATE GRAPH PAGE (FULL BOLD) 🔥 ---
+// --- 🔥 CREATE GRAPH PAGE (2 LINKS: SHORT & DIRECT) 🔥 ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -149,67 +149,90 @@ bot.action('batch_create_graph', async (ctx) => {
         return ctx.reply('⚠️ Queue empty. Send files and an image.');
     }
 
-    await ctx.reply("⏳ Creating Page...");
+    await ctx.reply("⏳ Creating Pages (Shortened & Direct)...");
 
-    let domNodes = [];
+    let shortNodes = [];
+    let directNodes = [];
 
     // 1. Title Extraction
     const firstFileCaption = userData.files[0] ? userData.files[0].caption : "Movie Collection";
     const cleanTitle = extractTitle(firstFileCaption);
 
-    // 2. Poster Image
-    if (userData.poster) {
-        domNodes.push({
-            tag: 'figure',
-            children: [
-                { tag: 'img', attrs: { src: userData.poster } },
-                { tag: 'figcaption', children: [cleanTitle] }
-            ]
+    // Helper Function to build common Header
+    const buildHeader = (nodes) => {
+        if (userData.poster) {
+            nodes.push({
+                tag: 'figure',
+                children: [
+                    { tag: 'img', attrs: { src: userData.poster } },
+                    { tag: 'figcaption', children: [cleanTitle] }
+                ]
+            });
+        }
+        nodes.push({ 
+            tag: 'p', 
+            children: [{ tag: 'b', children: ['Telegram Files'] }] 
         });
-    }
+    };
 
-    // 3. Header: "Telegram Files" (BOLD)
-    domNodes.push({ 
-        tag: 'p', 
-        children: [{ tag: 'b', children: ['Telegram Files'] }] 
-    });
+    // Helper Function to build common Footer
+    const buildFooter = (nodes) => {
+        nodes.push({ tag: 'br' });
+        nodes.push({ 
+            tag: 'p', 
+            children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
+        });
+    };
 
-    // 4. Files List (ALL BOLD)
+    // Build Headers for both pages
+    buildHeader(shortNodes);
+    buildHeader(directNodes);
+
+    // Build Files List for both pages
     for (const file of userData.files) {
         const shortLink = await getShortLink(file.longLink) || file.longLink;
+        const directLink = file.longLink;
         
-        // Use 'strong' tag for robust bolding
-        domNodes.push({
+        // 1. For Shortened Page
+        shortNodes.push({
             tag: 'p',
             children: [
-                // File Name (Bold)
-                { tag: 'strong', children: [file.caption] },
+                { tag: 'b', children: [file.caption] },
                 { tag: 'br' },
-                // Link (Bold + Clickable)
-                { 
-                    tag: 'strong', 
-                    children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] 
-                }
+                { tag: 'b', children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] }
+            ]
+        });
+        
+        // 2. For Direct Link Page
+        directNodes.push({
+            tag: 'p',
+            children: [
+                { tag: 'b', children: [file.caption] },
+                { tag: 'br' },
+                { tag: 'b', children: [{ tag: 'a', attrs: { href: directLink }, children: [directLink] }] }
             ]
         });
     }
 
-    // 5. Footer (BOLD)
-    domNodes.push({ tag: 'br' });
-    domNodes.push({ 
-        tag: 'p', 
-        children: [{ tag: 'strong', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
-    });
+    // Build Footers for both pages
+    buildFooter(shortNodes);
+    buildFooter(directNodes);
 
-    // Create Page
-    let graphUrl = await createTelegraphPage(cleanTitle, domNodes);
+    // Create Both Pages
+    let shortGraphUrl = await createTelegraphPage(cleanTitle, shortNodes);
+    let directGraphUrl = await createTelegraphPage(cleanTitle, directNodes);
 
-    if (graphUrl) {
-        graphUrl = graphUrl.replace('telegra.ph', 'graph.org');
-        await ctx.reply(`✅ **Graph Page Ready!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
+    if (shortGraphUrl && directGraphUrl) {
+        // Replace telegra.ph with graph.org
+        shortGraphUrl = shortGraphUrl.replace('telegra.ph', 'graph.org');
+        directGraphUrl = directGraphUrl.replace('telegra.ph', 'graph.org');
+        
+        await ctx.reply(`✅ **Graph Pages Ready!**\n\n🔗 **Shortened Links:**\n${shortGraphUrl}\n\n🔗 **Direct Links:**\n${directGraphUrl}`, { disable_web_page_preview: true });
+        
+        // Clear Queue after success
         delete global.batchStorage[ctx.from.id];
     } else {
-        await ctx.reply("❌ Failed to create Graph page.");
+        await ctx.reply("❌ Failed to create Graph pages.");
     }
 });
 
