@@ -65,24 +65,29 @@ const getShortLink = async (longUrl) => {
     } catch (error) { return null; }
 };
 
-// 2. Upload to Catbox
-const uploadToCatbox = async (fileUrl) => {
+// 2. Upload to Telegraph (NO LOGIN / NO API KEY REQUIRED)
+const uploadToTelegraph = async (fileUrl) => {
     try {
         const fileRes = await fetch(fileUrl);
         const blob = await fileRes.blob();
         const formData = new FormData();
-        formData.append('reqtype', 'fileupload');
-        formData.append('fileToUpload', blob, 'image.jpg');
+        formData.append('file', blob, 'image.jpg');
 
-        const response = await fetch('https://catbox.moe/user/api.php', {
+        const response = await fetch('https://telegra.ph/upload', {
             method: 'POST',
             body: formData
         });
         
-        const text = await response.text();
-        if (text.startsWith('http')) return text.trim();
+        const data = await response.json();
+        // Telegraph returns an array with 'src' path
+        if (data && data[0] && data[0].src) {
+            return `https://telegra.ph${data[0].src}`;
+        }
         return null;
-    } catch (e) { return null; }
+    } catch (e) {
+        console.error("Telegraph Upload Error:", e);
+        return null;
+    }
 };
 
 // 3. Create Telegraph Page
@@ -140,7 +145,6 @@ bot.action('admin_shortener', async (ctx) => {
     await ctx.reply(`⚙️ Send Shortener Config:\ndomain.com | api_key`);
 });
 
-// --- 🔥 CREATE GRAPH PAGE (2 LINKS: SHORT & DIRECT) 🔥 ---
 bot.action('batch_create_graph', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
 
@@ -149,90 +153,58 @@ bot.action('batch_create_graph', async (ctx) => {
         return ctx.reply('⚠️ Queue empty. Send files and an image.');
     }
 
-    await ctx.reply("⏳ Creating Pages (Shortened & Direct)...");
+    await ctx.reply("⏳ Creating Page...");
 
-    let shortNodes = [];
-    let directNodes = [];
+    let domNodes = [];
 
-    // 1. Title Extraction
     const firstFileCaption = userData.files[0] ? userData.files[0].caption : "Movie Collection";
     const cleanTitle = extractTitle(firstFileCaption);
 
-    // Helper Function to build common Header
-    const buildHeader = (nodes) => {
-        if (userData.poster) {
-            nodes.push({
-                tag: 'figure',
-                children: [
-                    { tag: 'img', attrs: { src: userData.poster } },
-                    { tag: 'figcaption', children: [cleanTitle] }
-                ]
-            });
-        }
-        nodes.push({ 
-            tag: 'p', 
-            children: [{ tag: 'b', children: ['Telegram Files'] }] 
-        });
-    };
-
-    // Helper Function to build common Footer
-    const buildFooter = (nodes) => {
-        nodes.push({ tag: 'br' });
-        nodes.push({ 
-            tag: 'p', 
-            children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
-        });
-    };
-
-    // Build Headers for both pages
-    buildHeader(shortNodes);
-    buildHeader(directNodes);
-
-    // Build Files List for both pages
-    for (const file of userData.files) {
-        const shortLink = await getShortLink(file.longLink) || file.longLink;
-        const directLink = file.longLink;
-        
-        // 1. For Shortened Page
-        shortNodes.push({
-            tag: 'p',
+    if (userData.poster) {
+        domNodes.push({
+            tag: 'figure',
             children: [
-                { tag: 'b', children: [file.caption] },
-                { tag: 'br' },
-                { tag: 'b', children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] }
-            ]
-        });
-        
-        // 2. For Direct Link Page
-        directNodes.push({
-            tag: 'p',
-            children: [
-                { tag: 'b', children: [file.caption] },
-                { tag: 'br' },
-                { tag: 'b', children: [{ tag: 'a', attrs: { href: directLink }, children: [directLink] }] }
+                { tag: 'img', attrs: { src: userData.poster } },
+                { tag: 'figcaption', children: [cleanTitle] }
             ]
         });
     }
 
-    // Build Footers for both pages
-    buildFooter(shortNodes);
-    buildFooter(directNodes);
+    domNodes.push({ 
+        tag: 'p', 
+        children: [{ tag: 'b', children: ['Telegram Files'] }] 
+    });
 
-    // Create Both Pages
-    let shortGraphUrl = await createTelegraphPage(cleanTitle, shortNodes);
-    let directGraphUrl = await createTelegraphPage(cleanTitle, directNodes);
+    for (const file of userData.files) {
+        const shortLink = await getShortLink(file.longLink) || file.longLink;
+        
+        domNodes.push({
+            tag: 'p',
+            children: [
+                { tag: 'b', children: [file.caption] },
+                { tag: 'br' },
+                { 
+                    tag: 'b', 
+                    children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] 
+                }
+            ]
+        });
+    }
 
-    if (shortGraphUrl && directGraphUrl) {
-        // Replace telegra.ph with graph.org
-        shortGraphUrl = shortGraphUrl.replace('telegra.ph', 'graph.org');
-        directGraphUrl = directGraphUrl.replace('telegra.ph', 'graph.org');
-        
-        await ctx.reply(`✅ **Graph Pages Ready!**\n\n🔗 **Shortened Links:**\n${shortGraphUrl}\n\n🔗 **Direct Links:**\n${directGraphUrl}`, { disable_web_page_preview: true });
-        
-        // Clear Queue after success
+    domNodes.push({ tag: 'br' });
+    domNodes.push({ 
+        tag: 'p', 
+        children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
+    });
+
+    let graphUrl = await createTelegraphPage(cleanTitle, domNodes);
+
+    if (graphUrl) {
+        graphUrl = graphUrl.replace('telegra.ph', 'graph.org');
+        await ctx.reply(`✅ **Graph Page Ready!**\n\n🔗 ${graphUrl}`, { disable_web_page_preview: false });
         delete global.batchStorage[ctx.from.id];
     } else {
-        await ctx.reply("❌ Failed to create Graph pages.");
+        await ctx.reply("❌ Failed to create Graph page.");
     }
 });
 
@@ -240,15 +212,18 @@ bot.action('batch_create_graph', async (ctx) => {
 
 bot.on('photo', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
-    await ctx.reply("🖼 Uploading to Catbox...");
+
+    await ctx.reply("🖼 Uploading Image...");
     try {
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         const fileLink = await ctx.telegram.getFileLink(photo.file_id);
-        const catboxUrl = await uploadToCatbox(fileLink.href);
+        
+        // Using Login-Free Telegraph Upload
+        const imgUrl = await uploadToTelegraph(fileLink.href);
 
-        if (catboxUrl) {
+        if (imgUrl) {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
-            global.batchStorage[ctx.from.id].poster = catboxUrl;
+            global.batchStorage[ctx.from.id].poster = imgUrl;
             await ctx.reply(`✅ **Poster Set!**\nNow send files.`, getAdminKeyboard());
         } else {
             await ctx.reply("❌ Upload Failed.");
