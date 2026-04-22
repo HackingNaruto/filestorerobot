@@ -65,28 +65,30 @@ const getShortLink = async (longUrl) => {
     } catch (error) { return null; }
 };
 
-// 2. Upload to Telegraph (NO LOGIN / NO API KEY REQUIRED)
-const uploadToTelegraph = async (fileUrl) => {
+// 2. Ultra-Fast Image Upload (NO LOGIN REQUIRED - Bypasses Vercel Limits)
+const uploadImageFast = async (fileUrl) => {
     try {
-        const fileRes = await fetch(fileUrl);
-        const blob = await fileRes.blob();
-        const formData = new FormData();
-        formData.append('file', blob, 'image.jpg');
-
-        const response = await fetch('https://telegra.ph/upload', {
-            method: 'POST',
-            body: formData
-        });
+        // FreeImage.host Public API key
+        const publicApiKey = '6d207e02198a847aa98d0a2a901485a5'; 
         
+        const params = new URLSearchParams();
+        params.append('key', publicApiKey);
+        params.append('action', 'upload');
+        params.append('source', fileUrl); // Sends URL directly
+        params.append('format', 'json');
+
+        const response = await fetch('https://freeimage.host/api/1/upload', {
+            method: 'POST',
+            body: params
+        });
+
         const data = await response.json();
-        // Telegraph returns an array with 'src' path
-        if (data && data[0] && data[0].src) {
-            return `https://telegra.ph${data[0].src}`;
+        if (data && data.status_code === 200 && data.image && data.image.url) {
+            return data.image.url;
         }
-        return null;
+        throw new Error("API rejected the upload");
     } catch (e) {
-        console.error("Telegraph Upload Error:", e);
-        return null;
+        throw new Error(e.message);
     }
 };
 
@@ -132,7 +134,6 @@ const getAdminKeyboard = () => {
 };
 
 // --- HANDLERS ---
-
 bot.action('batch_clear', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     delete global.batchStorage[ctx.from.id];
@@ -209,7 +210,6 @@ bot.action('batch_create_graph', async (ctx) => {
 });
 
 // --- UPLOAD HANDLERS ---
-
 bot.on('photo', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
 
@@ -218,8 +218,8 @@ bot.on('photo', async (ctx) => {
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         const fileLink = await ctx.telegram.getFileLink(photo.file_id);
         
-        // Using Login-Free Telegraph Upload
-        const imgUrl = await uploadToTelegraph(fileLink.href);
+        // Super-Fast API Method
+        const imgUrl = await uploadImageFast(fileLink.href);
 
         if (imgUrl) {
             if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
@@ -228,7 +228,9 @@ bot.on('photo', async (ctx) => {
         } else {
             await ctx.reply("❌ Upload Failed.");
         }
-    } catch (e) { ctx.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { 
+        ctx.reply(`❌ Error: ${e.message}`); 
+    }
 });
 
 bot.on(['document', 'video', 'audio'], async (ctx) => {
