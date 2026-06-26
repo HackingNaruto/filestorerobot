@@ -7,17 +7,17 @@ const ADMIN_ID = Number(process.env.ADMIN_ID);
 const FORCE_SUB_IDS = (process.env.FORCE_SUB_CHANNELS || "").split(',').map(id => id.trim()).filter(id => id);
 
 // --- MEMORY STORAGE ---
-global.batchStorage = global.batchStorage || {}; 
+global.userModes = global.userModes || {};     
+global.batchStorage = global.batchStorage || {};
 global.shortenerConfig = global.shortenerConfig || {
     domain: process.env.SHORTENER_DOMAIN || "", 
     key: process.env.SHORTENER_KEY || ""
 };
-global.telegraphToken = global.telegraphToken || ""; 
+global.awaitingShortenerConfig = global.awaitingShortenerConfig || {}; 
 
 // --- ERROR HANDLING ---
 bot.catch((err, ctx) => {
-    console.error(`Bot Error:`, err);
-    try { ctx.reply(`<b>Error: ${err.message}</b>`, { parse_mode: 'HTML' }); } catch(e) {}
+    console.error(`Error`, err);
 });
 
 // --- HELPERS ---
@@ -38,20 +38,23 @@ const decodePayload = (code) => {
 
 const cleanCaption = (text) => {
     if (!text) return "Untitled File";
+    // Remove specific unwanted lines
     let clean = String(text)
         .replace(/⭕️ Main Channel : @StarFlixTamil ⭕️/g, "")
-        .replace(/(Main Channel|Join Channel).*/gi, "")
-        .replace(/@[\w_]+/g, "");
+        .replace(/(Main Channel|Join Channel).*/gi, "");
+    
+    // Remove standalone @usernames
+    clean = clean.replace(/@[\w_]+/g, "");
+    
     return clean.trim();
 };
 
-const extractTitle = (text) => {
-    const match = text.match(/^(.+?\(\d{4}\))/);
-    if (match) return match[1].trim(); 
-    return text.split('-')[0].trim(); 
+const getGroupId = (text) => {
+    const cleaned = cleanCaption(text);
+    const words = cleaned.split(' ').filter(w => w.trim() !== "");
+    if (words.length >= 2) return `${words[0]} ${words[1]}`.toLowerCase();
+    return words[0] ? words[0].toLowerCase() : "unknown";
 };
-
-// --- API FUNCTIONS ---
 
 const getShortLink = async (longUrl) => {
     if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return null;
@@ -61,62 +64,31 @@ const getShortLink = async (longUrl) => {
         const data = await response.json();
         if (data.status === 'success' || data.shortenedUrl) return data.shortenedUrl;
         return null;
-    } catch (error) { return null; }
-};
-
-const uploadToImgbb = async (fileUrl) => {
-    try {
-        const apiKey = process.env.IMGBB_API_KEY;
-        if (!apiKey) throw new Error("Missing IMGBB_API_KEY");
-
-        const formData = new FormData();
-        formData.append('image', fileUrl); 
-
-        const response = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
-            method: 'POST',
-            body: formData
-        });
-        
-        const data = await response.json();
-        if (data.success) return data.data.url;
-        return null;
-    } catch (e) { return null; }
-};
-
-const createTelegraphPage = async (title, nodes) => {
-    try {
-        if (!global.telegraphToken) {
-            const accRes = await fetch(`https://api.telegra.ph/createAccount?short_name=StarFlix&author_name=@StarFlixTamil`);
-            const accData = await accRes.json();
-            if (accData.ok) global.telegraphToken = accData.result.access_token;
-        }
-
-        const contentStr = JSON.stringify(nodes);
-        const params = new URLSearchParams();
-        params.append('access_token', global.telegraphToken);
-        params.append('title', title);
-        params.append('author_name', '@StarFlixTamil');
-        params.append('author_url', 'https://t.me/StarFlixTamil');
-        params.append('content', contentStr);
-        params.append('return_content', 'true');
-
-        const response = await fetch('https://api.telegra.ph/createPage', {
-            method: 'POST',
-            body: params
-        });
-        
-        const data = await response.json();
-        if (data.ok) return data.result.url;
-        return null;
-    } catch (e) { return null; }
+    } catch (error) {
+        return null; 
+    }
 };
 
 // --- KEYBOARDS ---
-const getAdminKeyboard = () => {
+const getAdminKeyboard = (mode, count) => {
+    const safeMode = mode || 'batch';
     return Markup.inlineKeyboard([
+        [Markup.button.callback(`🔄 Mode: ${safeMode.toUpperCase()}`, 'admin_switch')],
         [Markup.button.callback(`⚙️ Setup Shortener`, 'admin_shortener')],
-        [Markup.button.callback(`📝 Create Graph Page`, 'batch_create_graph')],
-        [Markup.button.callback(`❌ Clear Queue`, 'batch_clear')]
+        [Markup.button.callback(`📤 Process Batch (${count})`, 'admin_process')],
+        [Markup.button.callback(`❌ Clear Batch`, 'admin_clear')]
+    ]);
+};
+
+const getFileControls = (shortCode) => {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('✂️ Shorten Link', `shorten_${shortCode}`)]
+    ]);
+};
+
+const getBatchControls = () => {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('✂️ Shorten All Links', 'batch_shorten_all')]
     ]);
 };
 
@@ -134,117 +106,6 @@ const getJoinButtons = async (ctx, payload) => {
     return Markup.inlineKeyboard(buttons);
 };
 
-// --- HANDLERS ---
-bot.action('batch_clear', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    delete global.batchStorage[ctx.from.id];
-    await ctx.reply("<b>Queue Cleared!</b>", { parse_mode: 'HTML', ...getAdminKeyboard() });
-});
-
-bot.action('admin_shortener', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    global.awaitingShortenerConfig[ctx.from.id] = true;
-    await ctx.reply("<b>Send Shortener Config:\ndomain.com | api_key</b>", { parse_mode: 'HTML' });
-});
-
-bot.action('batch_create_graph', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('Admin only');
-
-    const userData = global.batchStorage[ctx.from.id];
-    if (!userData || (!userData.files.length && !userData.poster)) {
-        return ctx.reply("<b>Queue is empty. Send files and an image.</b>", { parse_mode: 'HTML' });
-    }
-
-    await ctx.reply("<b>Creating Page...</b>", { parse_mode: 'HTML' });
-
-    let domNodes = [];
-    const firstFileCaption = userData.files[0] ? userData.files[0].caption : "Movie Collection";
-    const cleanTitle = extractTitle(firstFileCaption);
-
-    if (userData.poster) {
-        domNodes.push({
-            tag: 'figure',
-            children: [
-                { tag: 'img', attrs: { src: userData.poster } },
-                { tag: 'figcaption', children: [cleanTitle] }
-            ]
-        });
-    }
-
-    domNodes.push({ tag: 'p', children: [{ tag: 'b', children: ['Telegram Files'] }] });
-
-    for (const file of userData.files) {
-        const shortLink = await getShortLink(file.longLink) || file.longLink;
-        domNodes.push({
-            tag: 'p',
-            children: [
-                { tag: 'b', children: [file.caption] },
-                { tag: 'br' },
-                { tag: 'b', children: [{ tag: 'a', attrs: { href: shortLink }, children: [shortLink] }] }
-            ]
-        });
-    }
-
-    domNodes.push({ tag: 'br' });
-    domNodes.push({ 
-        tag: 'p', 
-        children: [{ tag: 'b', children: ['⭕️ Main Channel : @StarFlixTamil ⭕️'] }] 
-    });
-
-    let graphUrl = await createTelegraphPage(cleanTitle, domNodes);
-    if (graphUrl) {
-        graphUrl = graphUrl.replace('telegra.ph', 'graph.org');
-        await ctx.reply(`<b>Graph Page Ready!</b>\n\n<b>Link:</b> ${graphUrl}`, { parse_mode: 'HTML', disable_web_page_preview: false });
-        delete global.batchStorage[ctx.from.id];
-    } else {
-        await ctx.reply("<b>Failed to create Graph page.</b>", { parse_mode: 'HTML' });
-    }
-});
-
-bot.on('photo', async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    await ctx.reply("<b>Uploading Image to ImgBB...</b>", { parse_mode: 'HTML' });
-    try {
-        const photo = ctx.message.photo[ctx.message.photo.length - 1];
-        const fileLink = await ctx.telegram.getFileLink(photo.file_id);
-        const imgUrl = await uploadToImgbb(fileLink.href);
-
-        if (imgUrl) {
-            if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
-            global.batchStorage[ctx.from.id].poster = imgUrl;
-            await ctx.reply("<b>Poster Set! Now send files.</b>", { parse_mode: 'HTML', ...getAdminKeyboard() });
-        } else {
-            await ctx.reply("<b>Upload Failed. Check API Key.</b>", { parse_mode: 'HTML' });
-        }
-    } catch (e) { ctx.reply(`<b>Error: ${e.message}</b>`, { parse_mode: 'HTML' }); }
-});
-
-bot.on(['document', 'video', 'audio'], async (ctx) => {
-    if (!ctx.from) return; 
-    if (ctx.from.id !== ADMIN_ID) return ctx.reply("<b>Admin Only.</b>", { parse_mode: 'HTML' });
-    try {
-        const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
-        const code = encodePayload(sent.message_id);
-        const longLink = `https://t.me/${ctx.botInfo.username}?start=${code}`;
-        
-        let rawCap = ctx.message.caption || "";
-        if (!rawCap && ctx.message.document) rawCap = ctx.message.document.file_name;
-        if (!rawCap && ctx.message.video) rawCap = ctx.message.video.file_name;
-        if (!rawCap && ctx.message.audio) rawCap = ctx.message.audio.file_name;
-        const safeName = cleanCaption(rawCap);
-
-        if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = { files: [], poster: null };
-        global.batchStorage[ctx.from.id].files.push({ caption: safeName, longLink: longLink });
-
-        const count = global.batchStorage[ctx.from.id].files.length;
-        await ctx.reply(`<b>Added (${count})</b>`, { parse_mode: 'HTML' });
-        
-        if (count === 1) {
-            await ctx.reply("<b>Batch Started. Send all files, then click 'Create Graph'</b>", { parse_mode: 'HTML', ...getAdminKeyboard() });
-        }
-    } catch (e) { ctx.reply("<b>DB Channel Error. Ensure Bot is Admin in Channel.</b>", { parse_mode: 'HTML' }); }
-});
-
 const checkForceSub = async (ctx, userId) => {
     if (!userId) return true;
     if (userId === ADMIN_ID) return true;
@@ -258,6 +119,130 @@ const checkForceSub = async (ctx, userId) => {
     return true;
 };
 
+// --- ADMIN ACTIONS ---
+bot.action('admin_shortener', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    global.awaitingShortenerConfig[ctx.from.id] = true;
+    const current = global.shortenerConfig.domain ? `✅ Active: ${global.shortenerConfig.domain}` : "❌ Not Set";
+    await ctx.reply(`⚙️ Shortener Config\nStatus: ${current}\n\nSend: domain.com | api_key`);
+});
+
+bot.action(/shorten_(.+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
+    const code = ctx.match[1];
+    const longLink = `https://t.me/${ctx.botInfo.username}?start=${code}`;
+    
+    if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Configure Shortener first!', { show_alert: true });
+    
+    await ctx.answerCbQuery('⏳ Shortening...');
+    const shortLink = await getShortLink(longLink);
+    
+    if (shortLink) {
+        const msgText = ctx.callbackQuery.message.text || "";
+        // Extract caption by removing the link line
+        const caption = msgText.replace(/https:\/\/t\.me\/[^\s]+/, "").trim() || "File";
+        
+        // NO HTML, JUST PLAIN TEXT
+        await ctx.reply(`${caption}\n${shortLink}`, { disable_web_page_preview: true });
+    } else {
+        await ctx.answerCbQuery('❌ API Error.', { show_alert: true });
+    }
+});
+
+// --- 🔥 FINAL ROBUST BATCH SHORTENER 🔥 ---
+bot.action('batch_shorten_all', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('🔒 Admin only');
+    if (!global.shortenerConfig.domain || !global.shortenerConfig.key) return ctx.answerCbQuery('⚠️ Setup Shortener first!', { show_alert: true });
+
+    await ctx.answerCbQuery('⏳ Processing...');
+    
+    const text = ctx.callbackQuery.message.text;
+    if (!text) return;
+
+    // 1. Find all Telegram Links
+    const matches = [...text.matchAll(/https:\/\/t\.me\/[^\s]+/g)];
+    if (matches.length === 0) return ctx.answerCbQuery('No links found');
+
+    let finalMessage = "";
+    let lastIndex = 0;
+
+    for (const match of matches) {
+        const url = match[0];
+        const startIndex = match.index;
+
+        // 2. Get text BEFORE the link (This is the Caption)
+        // We trim it to remove extra newlines
+        let caption = text.substring(lastIndex, startIndex).trim();
+
+        // 3. Shorten
+        const short = await getShortLink(url);
+        const linkToShow = short || url; // Fallback to original if fail
+
+        // 4. Build Output (Plain Text)
+        // If caption exists, print it. If empty (rare), just print link.
+        if (caption) {
+            finalMessage += `${caption}\n${linkToShow}\n\n`;
+        } else {
+            finalMessage += `${linkToShow}\n\n`;
+        }
+
+        // Move cursor forward
+        lastIndex = startIndex + url.length;
+    }
+
+    try {
+        // Send as Plain Text (No Parse Mode = No Errors)
+        await ctx.reply(finalMessage, { disable_web_page_preview: true });
+    } catch (e) { 
+        ctx.reply(`Error: ${e.message}`); 
+    }
+});
+
+bot.action('admin_switch', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    const cur = global.userModes[ctx.from.id] || 'batch';
+    const next = cur === 'single' ? 'batch' : 'single';
+    global.userModes[ctx.from.id] = next;
+    if (next === 'single') delete global.batchStorage[ctx.from.id];
+    const count = global.batchStorage[ctx.from.id] ? global.batchStorage[ctx.from.id].length : 0;
+    await ctx.editMessageText(`⚙️ Admin Panel\nMode: ${next.toUpperCase()}\nQueue: ${count}`, getAdminKeyboard(next, count));
+});
+
+bot.action('admin_process', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    const files = global.batchStorage[ctx.from.id];
+    if (!files || !files.length) return ctx.answerCbQuery('⚠️ Empty Batch', { show_alert: true });
+    
+    await ctx.reply('⚙️ Processing...');
+    const groups = {};
+    files.forEach(f => {
+        const k = getGroupId(f.raw_caption);
+        if (!groups[k]) groups[k] = [];
+        groups[k].push(f);
+    });
+
+    for (const k in groups) {
+        let txt = "";
+        groups[k].forEach(f => {
+            const safeName = cleanCaption(f.raw_caption);
+            txt += `${safeName}\n${f.link}\n\n`;
+        });
+        // Plain text output for initial list too
+        try { await ctx.reply(txt, { disable_web_page_preview: true, ...getBatchControls() }); } catch(e) {
+            ctx.reply(`Error sending group: ${e.message}`);
+        }
+    }
+    delete global.batchStorage[ctx.from.id];
+    await ctx.reply('✅ Done!', getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0));
+});
+
+bot.action('admin_clear', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    delete global.batchStorage[ctx.from.id];
+    const mode = global.userModes[ctx.from.id] || 'batch';
+    await ctx.editMessageText(`⚙️ Admin Panel\nBatch Cleared!`, getAdminKeyboard(mode, 0));
+});
+
 bot.action(/checksub_(.+)/, async (ctx) => {
     const pl = ctx.match[1];
     if (await checkForceSub(ctx, ctx.from.id)) {
@@ -265,42 +250,62 @@ bot.action(/checksub_(.+)/, async (ctx) => {
         if (pl !== 'checksub_home') {
             const id = decodePayload(pl);
             if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e){}
-        } else await ctx.reply("<b>Welcome!</b>", { parse_mode: 'HTML' });
-    } else await ctx.answerCbQuery('Join the channel first!', { show_alert: true });
+        } else await ctx.reply('👋 Welcome!');
+    } else await ctx.answerCbQuery('⚠️ Join first!', { show_alert: true });
 });
 
+// --- ADMIN UPLOAD ---
+bot.on(['document', 'video', 'audio'], async (ctx) => {
+    if (!ctx.from) return; 
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ Admin Only.');
+    try {
+        const sent = await ctx.telegram.copyMessage(CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
+        const code = encodePayload(sent.message_id);
+        const link = `https://t.me/${ctx.botInfo.username}?start=${code}`;
+        const mode = global.userModes[ctx.from.id] || 'batch';
+        
+        let rawCap = ctx.message.caption || "";
+        if (!rawCap && ctx.message.document) rawCap = ctx.message.document.file_name;
+        if (!rawCap && ctx.message.video) rawCap = ctx.message.video.file_name;
+        if (!rawCap && ctx.message.audio) rawCap = ctx.message.audio.file_name;
+        if (!rawCap) rawCap = "Untitled File";
+
+        if (mode === 'single') {
+            const safeName = cleanCaption(rawCap);
+            // Plain text
+            await ctx.reply(`${safeName}\n${link}`, { disable_web_page_preview: true, ...getFileControls(code) });
+        } else {
+            if (!global.batchStorage[ctx.from.id]) global.batchStorage[ctx.from.id] = [];
+            global.batchStorage[ctx.from.id].push({ raw_caption: rawCap, link: link });
+            await ctx.reply(`📥 Added (${global.batchStorage[ctx.from.id].length})`);
+        }
+    } catch (e) { 
+        ctx.reply('❌ DB Channel Error.');
+    }
+});
+
+// --- START & TEXT ---
 bot.start(async (ctx) => {
     try {
         const pl = ctx.payload;
-        
-        // This is the restored block that processes the actual file delivery
-        if (pl) {
-            if (!await checkForceSub(ctx, ctx.from.id)) {
-                return ctx.reply("<b>Access Denied. Please join the channel first.</b>", { parse_mode: 'HTML', ...await getJoinButtons(ctx, pl) });
-            }
-            const id = decodePayload(pl);
-            if (id) {
-                try { 
-                    await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); 
-                } catch(e) { 
-                    ctx.reply("<b>File missing or Bot is not an Admin in the database channel.</b>", { parse_mode: 'HTML' }); 
-                }
-            } else {
-                ctx.reply("<b>Invalid Link.</b>", { parse_mode: 'HTML' });
-            }
-            return;
+        if (!await checkForceSub(ctx, ctx.from.id)) {
+            return ctx.reply('⚠️ Access Denied', { ...await getJoinButtons(ctx, pl) });
         }
         
-        if (ctx.from.id === ADMIN_ID) {
-            const userData = global.batchStorage[ctx.from.id];
-            const count = userData ? userData.files.length : 0;
-            const hasPoster = userData && userData.poster ? "Set" : "Not Set";
-            await ctx.reply(`<b>Admin Panel</b>\n<b>Files: ${count}</b>\n<b>Poster: ${hasPoster}</b>`, { parse_mode: 'HTML', ...getAdminKeyboard() });
+        if (pl) {
+            const id = decodePayload(pl);
+            if (id) try { await ctx.telegram.copyMessage(ctx.chat.id, CHANNEL_ID, id); } catch(e) { ctx.reply('❌ File missing.'); }
+            else ctx.reply('❌ Invalid Link.');
         } else {
-            ctx.reply("<b>Send me a valid link.</b>", { parse_mode: 'HTML' });
+            if (ctx.from.id === ADMIN_ID) {
+                const mode = global.userModes[ctx.from.id] || 'batch';
+                await ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard(mode, 0));
+            } else {
+                ctx.reply('🤖 Send me a link.');
+            }
         }
     } catch (e) {
-        console.error(e);
+        ctx.reply(`Start Error: ${e.message}`);
     }
 });
 
@@ -312,17 +317,23 @@ bot.on('text', async (ctx) => {
             const [domain, key] = text.split('|').map(s => s.trim());
             global.shortenerConfig = { domain, key };
             global.awaitingShortenerConfig[ctx.from.id] = false;
-            await ctx.reply(`<b>Configured: ${domain}</b>`, { parse_mode: 'HTML', ...getAdminKeyboard() });
+            await ctx.reply(`✅ Configured: ${domain}`);
+            return ctx.reply(`⚙️ Admin Panel`, getAdminKeyboard(global.userModes[ctx.from.id] || 'batch', 0));
         }
+        return ctx.reply('❌ Format: domain.com | api_key');
     }
 });
 
 export default async function handler(req, res) {
-    if (req.method === 'POST') {
-        if(!bot.botInfo) bot.botInfo = await bot.telegram.getMe();
-        await bot.handleUpdate(req.body);
-        return res.status(200).send('OK');
+    try {
+        if (req.method === 'POST') {
+            if(!bot.botInfo) bot.botInfo = await bot.telegram.getMe();
+            await bot.handleUpdate(req.body);
+            return res.status(200).send('OK');
+        }
+        return res.status(200).send('Bot Active 🚀');
+    } catch (e) {
+        console.error(e);
+        return res.status(500).send('Error');
     }
-    return res.status(200).send('Bot Active 🚀');
 }
- 
